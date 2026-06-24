@@ -5,27 +5,164 @@ Two backbone options: **CaRL PPO** (BEV raster) and **Alpamayo** (camera + VLM).
 
 ---
 
-## Prerequisites
+## Lab Computer Quick Start
 
-### 1. Install dependencies
+Requires conda, the nuPlan mini dataset on disk, and nuplan-devkit source cloned.
+All setup and training commands are driven by `make`.
 
-**Both backbones:**
+### Step 1 — Clone and enter the repo
+
 ```bash
-pip install stable-baselines3 torch numpy scipy matplotlib opencv-python gymnasium
-# nuplan-devkit: follow https://github.com/motional/nuplan-devkit
+git clone <repo-url>
+cd PRISM/PRISM
+```
+
+### Step 2 — Verify `lab.env`
+
+`lab.env` holds all machine-local paths. Confirm they match your machine before continuing:
+
+```bash
+cat lab.env
+```
+
+| Variable | Description |
+|---|---|
+| `NUPLAN_DATA_ROOT` | Root of the nuPlan dataset (`maps/`, `nuplan-v1.1/` live here) |
+| `NUPLAN_MAP_ROOT` | Path to the nuPlan maps folder |
+| `NUPLAN_MINI_ROOT` | Path to the mini split directory containing `.db` files |
+| `NUPLAN_DEVKIT_PATH` | Path to cloned nuplan-devkit source |
+| `MINI_CACHE_PATH` | Output path for mini scenario cache |
+| `CONDA_ENV` | Conda environment name (default: `prism`) |
+| `TORCH_CUDA_VERSION` | CUDA version for PyTorch wheel (e.g. `cu124`) |
+
+Check your CUDA version: `nvidia-smi | grep "CUDA Version"`
+
+### Step 3 — Create the conda environment
+
+```bash
+source lab.env
+make setup
+```
+
+`make setup` creates the `prism` conda environment from `environment.yml` (Python 3.9,
+all non-torch deps), then installs PyTorch with the correct CUDA wheel, nuplan-devkit
+from source, and the PRISM package.
+
+### Step 4 — Activate and verify
+
+```bash
+conda activate prism
+make check
+```
+
+`make check` runs `scripts/lab_check.sh` to confirm imports, data paths, and GPU
+visibility are all healthy before you build any cache.
+
+Add `source /path/to/PRISM/PRISM/lab.env` to `~/.bashrc` so paths are always set.
+
+### Step 5 — Build the mini scenario cache
+
+```bash
+make cache-mini
+```
+
+Builds the cache from `$NUPLAN_MINI_ROOT` into `$MINI_CACHE_PATH` (500 scenarios,
+takes a few minutes). Update `cache_path` in your training config to match.
+
+### Step 6 — Compute hyperparameters
+
+```bash
+make hyperparams-mini
+```
+
+Runs 20 IDM warm-up rollouts on the mini set — fast approximation sufficient to
+start a smoke-test run. Use `make hyperparams` (200 rollouts, full dataset) before
+a real training run.
+
+### Step 7 — Smoke-test training
+
+```bash
+make train-mini
+```
+
+Runs a short CaRL PPO training on the mini cache with K=2 policies. Confirm loss
+curves look sane before committing to a full run.
+
+---
+
+## Full training workflow
+
+Once the smoke test passes, run on the full dataset:
+
+```bash
+make cache          # build full scenario cache (~hours, run once)
+make hyperparams    # compute hyperparams from full dataset (200 rollouts)
+make train          # full PRISM training run
+```
+
+Or with explicit `python` commands — see the Manual section below.
+
+---
+
+## Makefile targets reference
+
+| Target | Description |
+|---|---|
+| `make setup` | Create conda env and install all packages |
+| `make check` | Verify environment, imports, data paths, GPU |
+| `make cache-mini` | Build cache from mini dataset (500 scenarios) |
+| `make cache` | Build cache from full training split |
+| `make hyperparams-mini` | Compute hyperparams from mini (20 rollouts) |
+| `make hyperparams` | Compute hyperparams from full dataset (200 rollouts) |
+| `make train-mini` | Smoke-test training on mini cache (K=2) |
+| `make train` | Full PRISM training run |
+| `make test` | Run unit tests |
+| `make clean` | Remove `__pycache__` and `.pyc` files |
+
+Any variable can be overridden on the command line:
+```bash
+make cache NUPLAN_DATA_ROOT=/my/path CACHE_PATH=/my/cache
+```
+
+---
+
+## Prerequisites (manual setup)
+
+Use this section if you need to run steps individually outside of `make`.
+
+### 1. Create conda environment
+
+```bash
+conda env create -f environment.yml
+conda activate prism
+```
+
+nuplan-devkit requires `numpy<2.0` — this is pinned in `environment.yml`.
+
+### 2. Install remaining packages
+
+```bash
+# PyTorch with CUDA — match to your driver
+source lab.env
+pip install torch --index-url https://download.pytorch.org/whl/$TORCH_CUDA_VERSION
+
+# nuplan-devkit from source
+pip install -e $NUPLAN_DEVKIT_PATH
+
+# PRISM package
+pip install -e .
 ```
 
 **Alpamayo only:**
 ```bash
-pip install transformers          # backbone loading
-pip install peft                  # Phase B LoRA fine-tuning only
+pip install transformers    # backbone loading
+pip install peft            # Phase B LoRA fine-tuning only
 ```
 
-### 2. Set data paths
+### 3. Set data paths
 
 ```bash
-export NUPLAN_DATA_ROOT=/data/nuplan/dataset
-export NUPLAN_MAP_ROOT=/data/nuplan/maps
+source lab.env
 ```
 
 **Alpamayo only** — sensor blob root for JPEG camera images:
@@ -35,24 +172,20 @@ export NUPLAN_SENSOR_ROOT=/data/nuplan/sensor_blobs
 If `NUPLAN_SENSOR_ROOT` is not set, the camera observation builder returns zero
 frames and logs a warning. Training proceeds structurally but without real images.
 
-### 3. Build the scenario cache
+### 4. Build the scenario cache
 
-Run once before any training:
 ```bash
-cd nuPlan && python carl_nuplan/planning/script/run_gym.py \
-    py_func=cache \
-    cache.cache_path=/data/prism_cache \
-    +scenario_builder=gym_nuplan \
-    +scenario_filter=train150k_split \
-    scenario_builder.data_root=$NUPLAN_DATA_ROOT \
-    scenario_builder.map_root=$NUPLAN_MAP_ROOT
+python scripts/build_cache.py \
+    --data_root  $NUPLAN_MINI_ROOT \
+    --map_root   $NUPLAN_MAP_ROOT \
+    --cache_path $MINI_CACHE_PATH \
+    --workers    4
 ```
 
-Update `cache_path` in your config file to match.
+`build_cache.py` reads directly from nuPlan `.db` files — no Hydra or YAML
+configs required. Update `cache_path` in your training config to match.
 
-### 4. Compute hyperparameters
-
-Run once before any training. Requires the nuPlan dataset to be accessible.
+### 5. Compute hyperparameters
 
 ```bash
 python compute_hyperparams.py \
@@ -62,8 +195,8 @@ python compute_hyperparams.py \
     --gamma 0.99
 ```
 
-All training commands below guard against a missing `hyperparams.json` and will
-exit with a clear error if this step was skipped.
+All training commands guard against a missing `hyperparams.json` and will exit
+with a clear error if this step was skipped.
 
 ---
 
