@@ -489,13 +489,16 @@ def parse_args():
                         help="Load pre-saved utility functions and go straight to Stage 2")
     parser.add_argument("--utility_fn_dir", type=str, default=None,
                         help="Directory containing saved utility function checkpoints")
+    parser.add_argument("--cache_path", type=str, default=None,
+                        help="Override cache_path from config (path to CaRL scenario cache)")
     # ── Backbone phase (Alpamayo experiment) ─────────────────────────────────
     parser.add_argument(
         "--model-backend", choices=["carl_ppo", "alpamayo"], default=None,
         help=(
             "Override the model_backend field in the config file. "
             "Useful for quick backend switches without swapping the whole config. "
-            "Note: backend-specific hyperparams (alpamayo_obs, alpamayo.*) must "
+            "Note: ba
+            ckend-specific hyperparams (alpamayo_obs, alpamayo.*) must "
             "still be present in the config file for the chosen backend."
         ),
     )
@@ -541,6 +544,8 @@ def main():
         cfg["output_dir"] = args.output_dir
     if args.seed is not None:
         cfg["seed"] = args.seed
+    if args.cache_path:
+        cfg["cache_path"] = args.cache_path
 
     # ── Backbone phase (Alpamayo only) ────────────────────────────────────────
     backbone_phase = args.backbone_phase  # "a", "b", or None
