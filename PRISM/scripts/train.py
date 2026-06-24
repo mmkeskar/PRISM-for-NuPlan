@@ -338,6 +338,8 @@ def parse_args():
                         help="Load pre-saved utility functions and go straight to Stage 2")
     parser.add_argument("--utility_fn_dir", type=str, default=None,
                         help="Directory containing saved utility function checkpoints")
+    parser.add_argument("--cache_path", type=str, default=None,
+                        help="Override cache_path from config (path to CaRL scenario cache)")
     return parser.parse_args()
 
 
@@ -361,6 +363,8 @@ def main():
         cfg["output_dir"] = args.output_dir
     if args.seed is not None:
         cfg["seed"] = args.seed
+    if args.cache_path:
+        cfg["cache_path"] = args.cache_path
 
     # ── Guard: hyperparams must exist ─────────────────────────────────────────
     _require_hyperparams(args.hyperparams)

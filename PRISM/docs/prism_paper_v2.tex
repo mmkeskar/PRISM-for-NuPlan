@@ -1,0 +1,645 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{bbm}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{PRISM: Pareto-optimal Risk-constrained drIving Style Manifold\\
+{\footnotesize A Distributional Multi-Objective Framework for Safe and
+Personalized Autonomous Driving}}
+
+\author{
+\IEEEauthorblockN{Anonymous Author(s)}
+\IEEEauthorblockA{Anonymous Institution}
+}
+
+\maketitle
+
+%----------------------------------------------------------
+\begin{abstract}
+Existing reinforcement learning (RL) planners for autonomous driving
+optimize a single scalar reward that encodes one fixed driving style and
+treats safety as a tradeable objective. This fails to serve users with
+diverse preferences and provides no formal safety guarantee against
+catastrophic tail-risk outcomes. We propose PRISM, a framework that
+learns a \emph{Distributional Pareto-Optimal} set of driving style
+policies---covering comfort-seeking, progress-oriented, disciplined, and
+cautious behaviours---while enforcing a hard Conditional Value-at-Risk
+(CVaR) safety constraint that is never traded away regardless of style
+preference. Building on Distributional Pareto-Optimal Multi-Objective
+Reinforcement Learning (DPMORL)~\cite{DPMORL2023}, we optimize over the
+entire return distribution of each style objective rather than
+expectations alone, producing policies that are robust to return
+uncertainty. Safety is enforced via a principled two-tier cost function
+separating outcome events from leading indicators, with indicator weights
+derived from empirical causal lead times to catastrophic outcomes. We
+further propose an \emph{$\alpha$-curriculum}: progressively tightening
+the CVaR confidence level from $\alpha\!=\!0.20$ to $\alpha\!=\!0.95$
+over training, co-scheduled with the baseline CVaR curve, to avoid
+over-conservative early training. We evaluate on the nuPlan closed-loop
+benchmark~\cite{nuPlan2024}, the most demanding publicly available
+planning benchmark for autonomous driving.
+\end{abstract}
+
+\begin{IEEEkeywords}
+autonomous driving, multi-objective reinforcement learning,
+safe reinforcement learning, CVaR, distributional RL,
+driving style personalisation, nuPlan
+\end{IEEEkeywords}
+
+%----------------------------------------------------------
+\section{Introduction}\label{sec:intro}
+
+Reinforcement learning has emerged as a promising paradigm for
+autonomous vehicle (AV) planning~\cite{CaRL2025,PDM2023}. However,
+contemporary RL planners share two fundamental limitations.
+
+\textbf{Single driving style.}
+Scalar reward weights encode a fixed behavioural trade-off. Different
+users have genuinely different driving preferences: some prefer smooth,
+comfort-oriented riding; others prefer assertive, progress-seeking
+behaviour~\cite{Yusof2016,Vasile2023}. A single policy cannot serve all
+users, and retraining per user is impractical. This inflexibility
+reduces trust and acceptance of autonomous
+vehicles~\cite{Haselberger2024}.
+
+\textbf{Expectation-only optimisation and unsafe safety treatment.}
+Current MORL approaches for driving optimise only the \emph{expected}
+return of each objective~\cite{Surmann2025}, treating two policies
+identically if they share the same expected returns even when their
+variance profiles differ fundamentally. Furthermore, existing approaches
+either include safety as a tradeable Pareto objective---allowing safety
+to be sacrificed for style---or use a fixed penalty that distorts
+behavioural objectives.
+
+PRISM addresses both problems simultaneously through two contributions:
+
+\begin{enumerate}
+  \item \textbf{Distributional Pareto-Optimal style policies.}
+    We learn policies whose \emph{entire return distributions} are
+    Pareto-optimal under stochastic dominance~\cite{DPMORL2023},
+    distinguishing consistently good policies from merely
+    average-good ones.
+
+  \item \textbf{Hard CVaR safety constraint with $\alpha$-curriculum.}
+    Safety is a non-negotiable CVaR bound on the tail of the cumulative
+    safety cost. A progressive $\alpha$-curriculum avoids over-conservative
+    early training while converging to a tight tail guarantee.
+\end{enumerate}
+
+%----------------------------------------------------------
+\section{Related Work}\label{sec:related}
+
+\subsection{RL-Based Autonomous Driving Planners}
+CaRL~\cite{CaRL2025} achieves state-of-the-art results on nuPlan
+through a simple route-completion reward with PPO, demonstrating that
+simplicity combined with scale outperforms complex shaped rewards.
+PDM~\cite{PDM2023} combines rule-based proposals with neural scoring.
+PRISM builds on CaRL's observation space and PPO implementation.
+
+\subsection{MORL for Autonomous Driving}
+Surmann et al.~\cite{Surmann2025} propose a single-policy MORL approach
+for personalised driving with runtime preference adaptation. Their method
+uses linear scalarisation of expected returns with no formal safety
+guarantee. PRISM differs in three ways: (i)~full return distribution
+optimisation; (ii)~safety as a hard CVaR constraint; (iii)~nuPlan
+evaluation rather than CARLA.
+
+Abouelazm et al.~\cite{BeyondScalar2026} introduce lexicographic safety
+via Quantile Dominance. Like PRISM, they argue safety should not be
+traded. However, they produce a single policy under a fixed hierarchy
+rather than a diverse safe Pareto front, and evaluate on CARLA.
+
+\subsection{Distributional and Risk-Sensitive RL}
+Distributional RL~\cite{C51_2017,QRDQN2018} models full return
+distributions. DPMORL~\cite{DPMORL2023} extends this to MORL via
+stochastic dominance and proves (Theorem~3) that CVaR-optimal policies
+belong to the DPO set---the theoretical basis for our combined
+framework. CVaR-constrained RL has been studied in general
+settings~\cite{CVaRCPO2024,CPPO2022,TRC2022} but not applied to MORL
+autonomous driving. The reward design review~\cite{RewardReview2024}
+identifies context-aware progress and tail-risk safety as open problems
+that PRISM directly addresses.
+
+\subsection{Safe RL for Autonomous Driving}
+Most safe RL approaches use expected cost
+constraints~\cite{CPO2017,Tessler2018}. Hu et al.~\cite{LSTC2024}
+demonstrate that purely long-term constraints allow vehicles to enter
+hazardous states during training, motivating our $\alpha$-curriculum
+which progressively tightens the constraint.
+
+%----------------------------------------------------------
+\section{Problem Formulation}\label{sec:formulation}
+
+\subsection{Multi-Objective MDP}
+
+\begin{equation}
+\mathcal{M}=(\mathcal{S},\mathcal{A},\mathcal{P},\mathcal{P}_{0},
+             \mathbf{R},c,\gamma,T)
+\end{equation}
+$\mathcal{S}$: BEV semantic segmentation (inherited from
+CaRL~\cite{CaRL2025}); $\mathcal{A}$: continuous acceleration and
+steering; $\mathbf{R}:\mathcal{S}\!\times\!\mathcal{A}\!\to\!\mathbb{R}^{4}$:
+style reward vector; $c$: scalar safety cost; $\gamma$: discount factor;
+$T$: episode horizon.
+
+\subsection{Style Reward Vector}\label{sec:rewards}
+
+\begin{equation}
+\mathbf{r}_{t}=\bigl(r^{\text{com}}_{t},\;r^{\text{prog}}_{t},\;
+               r^{\text{lat}}_{t},\;r^{\text{spc}}_{t}\bigr)\in(0,1]^{4}
+\end{equation}
+
+The four objectives are motivated by empirical studies identifying three
+primary axes of human driving-style preference: longitudinal
+assertiveness, lateral discipline, and spacing
+behaviour~\cite{Yusof2016,NatDriving2023}. Longitudinal behaviour is
+further split into comfort and progress because they capture orthogonal
+dimensions of assertiveness.
+
+\subsubsection{Comfort $r^{\text{com}}_{t}$}
+
+\begin{equation}
+r^{\text{com}}_{t}=
+  \exp\!\Bigl(-\frac{j_{\text{lon}}^{2}(t)+j_{\text{lat}}^{2}(t)}
+                    {\sigma_{j}^{2}}\Bigr)
+\label{eq:comfort}
+\end{equation}
+$j_{\text{lon}},j_{\text{lat}}$: longitudinal and lateral jerk.
+$\sigma_{j}^{2}$ is the empirical jerk variance from IDM warm-up
+rollouts, computed once and cached (Section~\ref{sec:hyperparams}).
+The exponential form bounds the reward in $(0,1]$ and is consistent
+with the normalization scheme across all four
+objectives~\cite{RewardReview2024}.
+
+\subsubsection{Progress $r^{\text{prog}}_{t}$}
+
+\begin{equation}
+r^{\text{prog}}_{t}=r^{\text{spd}}_{t}\cdot r^{\text{acc}}_{t}
+  \cdot\bigl(0.5+0.5\cdot r^{\text{lane}}_{t}\bigr)
+\label{eq:progress}
+\end{equation}
+
+The multiplicative structure enforces an AND condition: speed,
+acceleration, and lane choice must simultaneously be assertive.
+The lane-term floor of $0.5$ prevents temporary suboptimal lane
+positions from zeroing out the reward entirely.
+
+\textbf{Speed component:}
+\begin{equation}
+r^{\text{spd}}_{t}=\exp\!\Bigl(
+  -\frac{\max(0,\,v_{\text{des}}(t)-v_{\text{ego}}(t))}
+        {\beta\cdot v_{\text{des}}(t)}\Bigr)
+\end{equation}
+Asymmetric: only penalises being \emph{below} $v_{\text{des}}$; excess
+speed is handled by the safety cost. Normalisation by $v_{\text{des}}$
+makes the signal scale-invariant across road
+types~\cite{RewardReview2024}.
+
+\textbf{Regime-conditioned desired speed}, grounded in
+IDM~\cite{IDM1999,IDM25Years2025}:
+\begin{equation}
+v_{\text{des}}(t)=\begin{cases}
+  v_{\text{limit}}(t)     & \text{free flow}\\
+  v_{\text{lead}}(t)      & \text{car following}\\
+  v_{\text{lane\_avg}}(t) & \text{congested}
+\end{cases}
+\label{eq:vdesired}
+\end{equation}
+
+\textit{Regime detection rules.}
+\begin{itemize}
+  \item \textbf{Congested}: $v_{\text{lane\_avg}}(t)<0.5\cdot v_{\text{limit}}(t)$,
+    where $v_{\text{lane\_avg}}$ is the mean speed of vehicles in the
+    same lane within the observation horizon.
+  \item \textbf{Car following}: lead vehicle present in ego lane
+    within the observation horizon and not congested.
+  \item \textbf{Free flow}: no vehicle in ego lane within horizon.
+\end{itemize}
+Congestion is checked first; free flow is the default fallback.
+This context-aware formulation addresses the open problem identified
+by~\cite{RewardReview2024}.
+
+\textbf{Acceleration component:}
+\begin{equation}
+r^{\text{acc}}_{t}=1-\exp\!\Bigl(-\frac{|a_{\text{ego}}(t)|}{\gamma_{a}}\Bigr)
+\end{equation}
+Magnitude captures both assertive acceleration and decisive
+braking~\cite{Surmann2025}. $\gamma_{a}$ cached from warm-up rollouts.
+
+\textbf{Lane choice component:}
+\begin{equation}
+r^{\text{lane}}_{t}=\frac{\text{lane\_index}(t)}{N(t)-1},\quad
+N(t)>1;\quad r^{\text{lane}}_{t}=0.5,\quad N(t)=1
+\end{equation}
+Leftmost (fastest) lane scores 1; rightmost scores 0. The $N(t)=1$
+edge case prevents division by zero on single-lane roads.
+Lane choice is a progress signal, not a lateral-discipline
+signal~\cite{RewardReview2024}.
+
+\subsubsection{Lateral Discipline $r^{\text{lat}}_{t}$}
+
+\begin{equation}
+r^{\text{lat}}_{t}=r^{\text{dev}}_{t}\cdot r^{\text{hdg}}_{t}
+\label{eq:lateral}
+\end{equation}
+
+\textbf{Lane deviation:}
+\begin{equation}
+r^{\text{dev}}_{t}=
+  \delta_{d}+(1-\delta_{d})\cdot
+  \exp\!\Bigl(-\Bigl(\frac{d_{\text{lat}}(t)}{\sigma_{d}}\Bigr)^{2}\Bigr),
+\quad \delta_{d}=0.3
+\end{equation}
+$\sigma_{d}=0.2$\,m from empirical lane-keeping
+data~\cite{LKAEmpirical2025}. The floor $\delta_{d}=0.3$ prevents
+lane-change manoeuvres from being penalised as
+violations~\cite{Haselberger2024}.
+
+\textbf{Heading error:}
+\begin{equation}
+r^{\text{hdg}}_{t}=
+  \exp\!\Bigl(-\Bigl(\frac{|\Delta\psi(t)|}{\phi}\Bigr)^{2}\Bigr)
+\end{equation}
+$\Delta\psi$: heading angle error relative to lane centreline.
+$\phi$ cached from warm-up rollouts.
+
+\subsubsection{Spacing $r^{\text{spc}}_{t}$}
+
+\begin{equation}
+r^{\text{spc}}_{t}=
+  \delta_{s}+(1-\delta_{s})\cdot
+  \Bigl(1-\exp\!\Bigl(-\Bigl(\frac{\max(0,TTC(t))}{\tau}\Bigr)^{2}\Bigr)\Bigr),
+\quad\delta_{s}=0.2
+\label{eq:spacing}
+\end{equation}
+\begin{equation}
+TTC(t)=\frac{d_{\text{lead}}(t)}{v_{\text{ego}}(t)-v_{\text{lead}}(t)},
+\quad v_{\text{ego}}>v_{\text{lead}};\quad
+TTC(t)=\infty\;\text{otherwise}
+\end{equation}
+The floor $\delta_{s}=0.2$ keeps the reward non-degenerate during
+assertive following; dangerous low TTC is separately handled in~$c_{t}$.
+$\tau$ cached from warm-up rollouts.
+
+\subsection{Hyperparameter Computation}\label{sec:hyperparams}
+
+All scaling parameters
+$\Theta=\{\sigma_{j}^{2},\beta,\gamma_{a},\phi,\tau\}$
+are computed \emph{once} from $N_{\text{warm}}$ IDM warm-up rollouts
+before any policy training begins, stored to disk, and reused across all
+$K$ policies and all experiments. This ensures reproducibility and
+removes hyperparameter tuning from the training loop.
+
+Specifically, $\sigma_{j}^{2}$ is the empirical variance of jerk;
+$\beta$ and $\gamma_{a}$ are set so that a one-standard-deviation
+shortfall/excess produces a reward of $e^{-1}\!\approx\!0.37$;
+$\phi$ and $\tau$ are calibrated analogously.
+The $z_{t}$ normalisation statistics $(\mu_{i},\sigma_{i})$ for each
+return dimension are also estimated from warm-up rollouts and updated
+with an exponential moving average during training
+($\beta_{\text{ema}}=0.01$).
+
+\subsection{Distributional Pareto Optimality}\label{sec:dpo}
+
+Given policy $\pi$, the multi-objective cumulative return is:
+\begin{equation}
+\mathbf{Z}^{\pi}=\sum_{t=0}^{T}\gamma^{t}\mathbf{r}_{t}\in\mathbb{R}^{4}
+\end{equation}
+with joint distribution $\mu(\pi)$.
+
+\begin{definition}[Stochastic Dominance~\cite{DPMORL2023}]
+$\mu_{1}\!\succ_{\!SD}\!\mu_{2}$ iff $\mu_{1}\!\neq\!\mu_{2}$ and
+$\mathbb{E}_{z\sim\mu_{1}}[f(z)]\geq\mathbb{E}_{z\sim\mu_{2}}[f(z)]$
+for every non-decreasing $f:\mathbb{R}^{4}\!\to\!\mathbb{R}$.
+\end{definition}
+
+\begin{definition}[DPO Policy~\cite{DPMORL2023}]
+$\pi$ is Distributional Pareto-Optimal (DPO) if no $\pi'$ satisfies
+$\mu(\pi')\succ_{\!SD}\mu(\pi)$.
+\end{definition}
+
+DPO is strictly stronger than standard Pareto optimality: it prevents
+stochastic dominance across the full return distribution, not just
+across expected values. DPMORL Theorem~3~\cite{DPMORL2023} proves that
+CVaR-optimal policies are DPO, providing the theoretical basis for
+combining the distributional Pareto front with a CVaR constraint.
+
+\subsection{Safety Cost Function}\label{sec:safety}
+
+\begin{equation}
+c_{t}=c_{t}^{\text{out}}+\sum_{j}c_{t}^{\text{lead},j}
+\label{eq:cost}
+\end{equation}
+
+\subsubsection{Outcome Events}
+
+\begin{equation}
+c_{t}^{\text{out}}=\sum_{e\in\mathcal{E}}W_{e}\cdot\mathbb{1}_{e}(t)
+\end{equation}
+
+\begin{table}[h]
+\centering
+\caption{Outcome Event Weights (calibrated to nuPlan severity
+protocol~\cite{nuPlan2024})}
+\begin{tabular}{lc}
+\toprule
+Event & $W_{e}$\\
+\midrule
+VRU collision (pedestrian/cyclist)    & 100\\
+Wrong-direction driving               & 100\\
+Vehicle collision                     & 80\\
+Red light violation                   & 80\\
+Stop sign violation                   & 70\\
+Drivable area violation               & 65\\
+Object collision                      & 40\\
+\bottomrule
+\end{tabular}
+\label{tab:weights}
+\end{table}
+
+VRU and wrong-direction driving share the highest weight: VRU collisions
+have zero tolerance~\cite{nuPlan2024}; wrong-direction driving creates
+head-on scenarios with combined closing speeds comparable to the most
+severe VRU outcomes~\cite{AV_Collision2022}. Vehicle collision is set to
+80 to maintain a meaningful gap from VRU~\cite{AV_Liability2023}.
+Drivable area violation is assigned 65 rather than the maximum because
+its severity is inherently continuous---minor kerb excursions differ
+qualitatively from complete road departures~\cite{nuPlan2024}.
+
+\subsubsection{Leading Indicator Weights}
+
+Leading indicators provide a dense gradient signal during training.
+Without them, the agent receives almost no gradient during the majority
+of timesteps when no outcome event fires~\cite{LSTC2024}.
+
+For indicator $j$ with outcome set $\mathcal{O}_{j}$:
+\begin{equation}
+w_{j}^{\text{lead}}=\sum_{i\in\mathcal{O}_{j}}
+  \frac{W_{i}}{|\mathcal{O}_{j}|\cdot T_{j\to i}}
+\label{eq:indweight}
+\end{equation}
+$T_{j\to i}$ is the empirically measured mean lead time in timesteps
+from indicator $j$ to outcome $i$, estimated from IDM warm-up rollouts.
+This ensures a violation firing for its natural lead time produces a
+cumulative cost equal to the average weight of outcomes it can cause.
+
+\textit{Severity signals} $s_{j}(t)\in[0,1]$:
+\begin{align}
+s_{\text{TTC}}(t)&=\max\!\Bigl(0,\frac{\tau_{\text{TTC}}-TTC(t)}
+  {\tau_{\text{TTC}}}\Bigr)\cdot\mathbb{1}[TTC(t)<1.5\text{s}]\\
+s_{\text{THW}}(t)&=\max\!\Bigl(0,\frac{\tau_{\text{THW}}-THW(t)}
+  {\tau_{\text{THW}}}\Bigr)\cdot\mathbb{1}[THW(t)<2\text{s}]\\
+s_{\text{spd}}(t)&=\max\!\Bigl(0,\frac{v_{\text{ego}}(t)-v_{\theta}(t)}
+  {v_{\theta}(t)}\Bigr)\cdot\mathbb{1}[v_{\text{ego}}>v_{\theta}]\\
+s_{\text{blind}}(t)&=\mathbb{1}[|\dot{y}_{\text{ego}}|>\theta_{\text{lc}}]
+  \cdot\mathbb{1}[\exists\text{ agent in blind spot}]\\
+s_{\text{rl}}(t)&=\mathbb{1}[t_{\text{arrival}}(t)>t_{\text{red}}(t)]
+\end{align}
+where $v_{\theta}(t)=v_{\text{limit}}(t)(1+\delta_{\text{road}})$ is the
+road-type-conditioned speed threshold and
+$THW(t)=d_{\text{lead}}(t)/v_{\text{ego}}(t)$.
+
+Per-timestep cost: $c_{t}^{\text{lead},j}=w_{j}^{\text{lead}}\cdot s_{j}(t)$.
+
+\textit{Episode-level cap} for persistent indicators
+(TTC, THW, speed):
+\begin{equation}
+\sum_{t=0}^{T}c_{t}^{\text{lead},j}\leq
+  \bar{W}_{j}^{\text{out}}=
+  \frac{\sum_{i\in\mathcal{O}_{j}}W_{i}}{|\mathcal{O}_{j}|}
+\label{eq:cap}
+\end{equation}
+Transient indicators (blind spot, predicted red light) whose natural
+duration matches their lead time require no cap.
+
+\subsection{CVaR Safety Constraint with $\alpha$-Curriculum}
+\label{sec:cvar}
+
+\subsubsection{CVaR Constraint}
+
+\begin{equation}
+\text{CVaR}_{\alpha}(C^{\pi})=
+  \mathbb{E}\bigl[C^{\pi}\mid C^{\pi}\geq\text{VaR}_{\alpha}(C^{\pi})\bigr]
+  \leq\epsilon
+\label{eq:cvar}
+\end{equation}
+$C^{\pi}=\sum_{t}\gamma^{t}c_{t}$ is the trajectory-level cumulative
+safety cost, a random variable over rollouts. At $\alpha\!=\!0.95$:
+even in the worst $5\%$ of trajectories, the expected safety cost is
+bounded by $\epsilon$.
+
+\subsubsection{$\alpha$-Curriculum}
+
+Standard CVaR-constrained RL uses a fixed $\alpha$ throughout
+training~\cite{CVaRCPO2024,TRC2022,CPPO2022}. Early in training, a
+tight tail constraint ($\alpha\!=\!0.95$) is difficult to satisfy for
+an inexperienced policy, causing the Lagrange multiplier $\lambda_{k}$
+to spike and crush style optimisation before the policy has learned
+basic driving competence.
+
+We propose an $\alpha$-curriculum: linearly increasing $\alpha$ from
+$\alpha_{\text{start}}$ to $\alpha_{\text{end}}$ over
+$N_{\text{cur}}$ training iterations:
+
+\begin{equation}
+\alpha(n)=\alpha_{\text{start}}+(\alpha_{\text{end}}-\alpha_{\text{start}})
+  \cdot\min\!\Bigl(1,\frac{n}{N_{\text{cur}}}\Bigr)
+\label{eq:curriculum}
+\end{equation}
+with $\alpha_{\text{start}}\!=\!0.20$, $\alpha_{\text{end}}\!=\!0.95$.
+
+At $\alpha\!=\!0.20$, the constraint covers the worst $80\%$ of
+trajectories---providing a broad safety signal early in training
+analogous to mean-cost constraints. As $\alpha$ increases, the constraint
+progressively focuses on catastrophic tail events.
+
+\textbf{Co-scheduled safety budget.}
+To prevent the constraint from hardening abruptly as $\alpha$ increases,
+$\epsilon$ is co-scheduled with the CaRL baseline CVaR curve, pre-computed
+from $N_{\text{warm}}$ IDM rollouts:
+\begin{equation}
+\epsilon(n)=\widehat{\text{CVaR}}_{\alpha(n)}^{\text{IDM}}
+\label{eq:epsilon}
+\end{equation}
+This means at every stage the constraint requires policies to be at
+least as safe as IDM at the current tail level.
+
+\subsection{Full Optimisation Problem}\label{sec:opt}
+
+Find $K\!=\!5$ DPO policies $\{\pi_{1},\ldots,\pi_{K}\}$ where each
+$\pi_{k}$ solves:
+\begin{equation}
+\max_{\pi_{k}}\;\mathbb{E}_{z\sim\mu(\pi_{k})}\bigl[f_{\theta_{k}}(z)\bigr]
+\quad\text{s.t.}\quad
+\text{CVaR}_{\alpha(n)}\bigl(C^{\pi_{k}}\bigr)\leq\epsilon(n)
+\label{eq:fullopt}
+\end{equation}
+$f_{\theta_{k}}:\mathbb{R}^{4}\!\to\!\mathbb{R}$ is a non-linear,
+non-decreasing utility function from DPMORL Stage~1.
+
+%----------------------------------------------------------
+\section{PRISM Training Algorithm}\label{sec:algorithm}
+
+\subsection{Stage 1: Utility Function Generation}
+
+Generate $K$ diverse non-decreasing neural networks
+$f_{\theta_{1}},\ldots,f_{\theta_{K}}$ over $[0,1]^{4}$ using
+DPMORL's diversity objective~\cite{DPMORL2023}:
+\begin{equation}
+J(\theta_{i})=
+  \alpha_{\text{div}}\cdot J^{\text{val}}(\theta_{i})+
+  (1-\alpha_{\text{div}})\cdot J^{\text{grad}}(\theta_{i})
+\end{equation}
+\begin{align}
+J^{\text{val}}(\theta_{i})&=\min_{j\neq i}
+  \mathbb{E}_{z\sim U([0,1]^{4})}
+  \bigl[(f_{\theta_{i}}(z)-f_{\theta_{j}}(z))^{2}\bigr]\\
+J^{\text{grad}}(\theta_{i})&=\min_{j\neq i}
+  \mathbb{E}_{z_{1},z_{2}}
+  \Bigl[\Bigl(\frac{\Delta f_{\theta_{i}}}{\|z_{2}-z_{1}\|}
+             -\frac{\Delta f_{\theta_{j}}}{\|z_{2}-z_{1}\|}\Bigr)^{2}\Bigr]
+\end{align}
+This produces $K$ utility functions differing in both value and
+gradient, ensuring genuine coverage of diverse style preferences.
+
+\subsection{Stage 2: Policy Optimisation}
+
+\subsubsection{State Augmentation}
+\begin{equation}
+\tilde{s}_{t}=(s_{t},z_{t}),\quad
+z_{t}=\sum_{\tau=0}^{t}\gamma^{\tau}\mathbf{r}_{\tau},\quad
+z_{t+1}=z_{t}+\gamma^{t}\mathbf{r}_{t}
+\end{equation}
+$z_{t}$ is normalised using statistics from warm-up rollouts,
+updated via EMA during training.
+
+\subsubsection{Scalar Reward via Utility Difference}
+\begin{equation}
+R_{t}=\gamma^{-t}\bigl[f_{\theta_{k}}(z_{t+1})-f_{\theta_{k}}(z_{t})\bigr]
+\label{eq:scalar}
+\end{equation}
+DPMORL Theorem~2 guarantees the optimal policy of this augmented MDP
+equals the optimal policy under $f_{\theta_{k}}$~\cite{DPMORL2023}.
+
+\subsubsection{CVaR-Lagrangian Objective}
+\begin{equation}
+\max_{\theta_{k}}\min_{\lambda_{k}\geq0}\;
+  \mathbb{E}\Bigl[\sum_{t}R_{t}\Bigr]
+  -\lambda_{k}\bigl(\widehat{\text{CVaR}}_{\alpha(n)}(C^{\pi_{k}})-\epsilon(n)\bigr)
+\label{eq:lagrangian}
+\end{equation}
+Each policy has its own $\lambda_{k}$: different style preferences yield
+different trajectory distributions and therefore different safety cost
+distributions; a shared multiplier would distort the Pareto front.
+
+\subsubsection{CVaR Estimation}
+
+Collect $N$ rollouts per policy per iteration. Sort cumulative costs
+$\{C^{i}\}$ descending; average the worst
+$\lceil(1-\alpha(n))N\rceil$:
+\begin{equation}
+\widehat{\text{CVaR}}_{\alpha(n)}=
+  \frac{1}{|\mathcal{T}|}\sum_{i\in\mathcal{T}}C^{i}
+\end{equation}
+
+\subsubsection{Lagrange Multiplier Update}
+\begin{equation}
+\lambda_{k}\leftarrow\max\!\Bigl(0,\;
+  \lambda_{k}+\eta_{\lambda}\bigl(
+    \widehat{\text{CVaR}}_{\alpha(n)}-\epsilon(n)\bigr)\Bigr)
+\label{eq:lambda}
+\end{equation}
+
+\subsubsection{Base RL}
+PPO~\cite{PPO2017} via Stable-Baselines3~\cite{SB3_2021}. Effective
+per-timestep reward: $\tilde{R}_{t}=R_{t}-\lambda_{k}\cdot c_{t}$.
+Policies are trained \emph{from scratch} (random initialisation) to
+avoid reward bias from CaRL's scalar objective. $z_{t}$ normalisation
+is bootstrapped from $N_{\text{warm}}$ IDM rollouts collected prior
+to training.
+
+\begin{algorithm}
+\caption{PRISM Training}
+\begin{algorithmic}[1]
+\STATE Collect $N_{\text{warm}}$ IDM rollouts; compute and
+       cache $\Theta$, $\epsilon$-curve, $T_{j\to i}$ values
+\STATE \textbf{Stage~1}: Generate $K$ utility functions
+       $\{f_{\theta_{k}}\}$
+\STATE Initialise $\lambda_{k}\leftarrow0$ for all $k$
+\FOR{$k=1$ to $K$}
+  \STATE Initialise $\pi_{k}$ randomly
+  \FOR{iteration $n=1,2,\ldots$}
+    \STATE Compute $\alpha(n)$, $\epsilon(n)$ via
+           Eq.~\eqref{eq:curriculum},\eqref{eq:epsilon}
+    \STATE Collect $N$ rollouts; compute $R_{t}$, $c_{t}$, $C^{i}$
+    \STATE Estimate $\widehat{\text{CVaR}}_{\alpha(n)}$
+    \STATE PPO update with $\tilde{R}_{t}=R_{t}-\lambda_{k}c_{t}$
+    \STATE Update $\lambda_{k}$ via Eq.~\eqref{eq:lambda}
+    \STATE Update $z_{t}$ normalisation via EMA
+  \ENDFOR
+\ENDFOR
+\STATE \textbf{Output}: CVaR-safe Distributional Pareto Front
+       $\{\pi_{1},\ldots,\pi_{K}\}$
+\end{algorithmic}
+\end{algorithm}
+
+%----------------------------------------------------------
+\section{Novelty and Limitations}\label{sec:novelty}
+
+\subsection{Contributions}
+
+\begin{enumerate}
+  \item First application of DPMORL to autonomous driving with
+    domain-specific style objectives grounded in human preference
+    research~\cite{Yusof2016,NatDriving2023}.
+  \item CVaR safety constraint on a distributional Pareto front,
+    theoretically justified by DPMORL Theorem~3~\cite{DPMORL2023}.
+  \item $\alpha$-curriculum for CVaR-constrained training: progressive
+    tail tightening with co-scheduled safety budget, novel to the
+    safe RL literature.
+  \item Principled two-tier safety cost with indicator weights derived
+    from empirical causal lead times, avoiding hand-tuning.
+  \item Context-aware desired speed via regime detection, addressing
+    an open problem in reward design~\cite{RewardReview2024}.
+\end{enumerate}
+
+\subsection{Limitations}
+
+Comfort and efficiency are combined into one longitudinal objective;
+disentanglement is future work. Lane choice reward assumes leftmost
+lane is fastest---mandatory turn scenarios are not handled in this
+layer. Predicted red light violation relies on nuPlan's inferred
+traffic light timing. $K\!=\!5$ discrete policies approximate the
+continuous Pareto front; continuous preference
+conditioning~\cite{Surmann2025} is a natural extension.
+
+%----------------------------------------------------------
+\section{Conclusion}\label{sec:conclusion}
+
+PRISM learns a CVaR-safe Distributional Pareto Front of autonomous
+driving styles, cleanly separating style optimisation from
+non-negotiable safety constraints. The $\alpha$-curriculum is a
+novel training mechanism applicable beyond autonomous driving to
+any CVaR-constrained RL problem. We believe PRISM provides a
+principled foundation for personalised, trustworthy AV systems.
+
+%----------------------------------------------------------
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

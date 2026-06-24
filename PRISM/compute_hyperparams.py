@@ -163,6 +163,7 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     # beta: normalised speed shortfall is already unit-free;
     # set beta = 0.5 so a 50% shortfall -> reward = e^{-1}
     beta = 0.5
+    sigma_d = 0.2  # tolerance width for lateral deviation following lane keeping data W. Zhang et al., “Empirical performance evaluation of lane keeping assistance systems,” arXiv preprint arXiv:2505.11534, 2025.
 
     return {
         "sigma_j_sq": sigma_j_sq,
@@ -170,6 +171,7 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
         "gamma_a":    gamma_a,
         "phi":        phi,
         "tau":        tau,
+        "sigma_d":    sigma_d,
     }
 
 

@@ -1,0 +1,34 @@
+# ── Machine-local config (never commit) ──────────────────────────────────────
+lab.env
+
+# ── Auto-generated (recomputed per machine) ───────────────────────────────────
+hyperparams.json
+
+# ── Training outputs ──────────────────────────────────────────────────────────
+runs/
+wandb/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Editors / OS ─────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Docs build ───────────────────────────────────────────────────────────────
+docs/_build/
