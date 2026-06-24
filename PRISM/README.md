@@ -19,10 +19,12 @@ cd PRISM/PRISM
 
 ### Step 2 — Verify `lab.env`
 
-`lab.env` holds all machine-local paths. Confirm they match your machine before continuing:
+`lab.env` holds all machine-local paths. Confirm they match your machine, then run the automated check:
 
 ```bash
-cat lab.env
+cat lab.env          # inspect values
+source lab.env
+make check-env       # validates paths and file types, no conda required
 ```
 
 | Variable | Description |
@@ -109,6 +111,7 @@ Or with explicit `python` commands — see the Manual section below.
 | Target | Description |
 |---|---|
 | `make setup` | Create conda env and install all packages |
+| `make check-env` | Validate `lab.env` paths and file types (no conda needed) |
 | `make check` | Verify environment, imports, data paths, GPU |
 | `make cache-mini` | Build cache from mini dataset (500 scenarios) |
 | `make cache` | Build cache from full training split |
@@ -203,6 +206,13 @@ with a clear error if this step was skipped.
 ## Training — CaRL PPO backbone
 
 Uses CaRL's BEV semantic segmentation observation space.
+
+```bash
+make train-mini   # smoke test: mini cache, K=2 policies
+make train        # full run: full cache, K=5 policies, output → runs/prism_run_001
+```
+
+Or with explicit arguments:
 
 ```bash
 python scripts/train.py \

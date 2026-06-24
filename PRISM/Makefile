@@ -32,7 +32,7 @@ TORCH_CUDA_VERSION ?= cu121
 # Use the conda env's python if activated; otherwise fall back to system python
 PYTHON            := python
 
-.PHONY: all setup check cache cache-mini hyperparams hyperparams-mini \
+.PHONY: all setup check-env check cache cache-mini hyperparams hyperparams-mini \
         train train-mini test clean help
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,6 +45,7 @@ help:
 	@echo ""
 	@echo "PRISM Lab Makefile"
 	@echo "────────────────────────────────────────────────────"
+	@echo "  make check-env          Validate lab.env paths (no conda needed)"
 	@echo "  make setup              One-time environment setup"
 	@echo "  make check              Verify environment is ready"
 	@echo "  make cache-mini         Build cache from mini dataset"
@@ -58,6 +59,13 @@ help:
 	@echo ""
 	@echo "Set paths in lab.env or pass on CLI."
 	@echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# lab.env validation (no conda needed — run this first)
+# ─────────────────────────────────────────────────────────────────────────────
+
+check-env:
+	@bash scripts/check_env.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # One-time setup
