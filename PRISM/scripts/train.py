@@ -260,14 +260,25 @@ def _build_agent(
 
         config = GlobalConfig()
         config.initialize(**{k: v for k, v in cfg.items() if hasattr(config, k)})
-        carl_policy = PPOPolicy(
+        obs_space = (
             env.single_observation_space if hasattr(env, "single_observation_space")
-            else env.observation_space,
+            else env.observation_space
+        )
+        act_space = (
             env.single_action_space if hasattr(env, "single_action_space")
-            else env.action_space,
-            config=config,
+            else env.action_space
+        )
+        carl_policy = PPOPolicy(obs_space, act_space, config=config).to(device)
+
+        reward_dim = cfg.get("reward_dim", 4)
+        return CaRLPPOAdapter(
+            carl_policy=carl_policy,
+            reward_dim=reward_dim,
+            features_dim=config.features_dim,
+            policy_head_arch=tuple(getattr(config, "policy_head_arch", [256, 256])),
+            action_dim=int(act_space.shape[0]),
+            init_log_std=cfg.get("carl_init_log_std", -0.5),
         ).to(device)
-        return CaRLPPOAdapter(carl_policy)
 
     if backend == "alpamayo":
         from prism.models.alpamayo.adapter import AlpamayoAdapter
