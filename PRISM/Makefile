@@ -80,8 +80,14 @@ setup: environment.yml
 	conda run -n $(CONDA_ENV) pip install torch \
 	    --index-url https://download.pytorch.org/whl/$(TORCH_CUDA_VERSION)
 	@echo ""
+	@echo "── Installing nuplan-devkit dependencies ──"
+	conda run -n $(CONDA_ENV) pip install -r $(NUPLAN_DEVKIT_PATH)/requirements.txt
+	@echo ""
 	@echo "── Installing nuplan-devkit ──"
 	conda run -n $(CONDA_ENV) pip install -e $(NUPLAN_DEVKIT_PATH)
+	@echo ""
+	@echo "── Installing CaRL (carl_nuplan) ──"
+	conda run -n $(CONDA_ENV) pip install -e ../nuPlan
 	@echo ""
 	@echo "── Installing PRISM package ──"
 	conda run -n $(CONDA_ENV) pip install -e .

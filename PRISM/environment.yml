@@ -1,6 +1,6 @@
 name: prism
 # PRISM conda environment
-# Python and non-torch scientific dependencies.
+# Python 3.10+ required by nuplan-devkit 1.2.x dependencies.
 # torch is installed separately by `make setup` so CUDA version can be matched
 # to the lab machine's driver. nuplan-devkit is also installed separately
 # (pip install -e <nuplan_devkit_path>) since its version must match the dataset.
@@ -13,7 +13,7 @@ channels:
   - defaults
 
 dependencies:
-  - python=3.9
+  - python=3.10
   - pip
   - numpy<2.0           # nuplan-devkit requires numpy<2
   - scipy

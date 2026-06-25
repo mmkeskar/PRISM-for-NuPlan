@@ -46,7 +46,7 @@ source lab.env
 make setup
 ```
 
-`make setup` creates the `prism` conda environment from `environment.yml` (Python 3.9,
+`make setup` creates the `prism` conda environment from `environment.yml` (Python 3.10,
 all non-torch deps), then installs PyTorch with the correct CUDA wheel, nuplan-devkit
 from source, and the PRISM package.
 
@@ -140,7 +140,7 @@ conda env create -f environment.yml
 conda activate prism
 ```
 
-nuplan-devkit requires `numpy<2.0` — this is pinned in `environment.yml`.
+nuplan-devkit 1.2.x requires Python 3.10+ and `numpy<2.0` — both pinned in `environment.yml`.
 
 ### 2. Install remaining packages
 

@@ -33,10 +33,10 @@ echo "── Python ──"
 PY_VER=$(python --version 2>&1 | awk '{print $2}')
 MAJOR=$(echo "$PY_VER" | cut -d. -f1)
 MINOR=$(echo "$PY_VER" | cut -d. -f2)
-if [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 9 ]; then
+if [ "$MAJOR" -eq 3 ] && [ "$MINOR" -ge 10 ]; then
     pass "Python $PY_VER"
 else
-    fail "Python $PY_VER — need 3.9+. Activate the prism conda env: conda activate prism"
+    fail "Python $PY_VER — need 3.10+. Activate the prism conda env: conda activate prism"
 fi
 
 # ── 2. Core Python packages ───────────────────────────────────────────────────
