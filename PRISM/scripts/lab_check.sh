@@ -248,8 +248,7 @@ if [ "$FAIL" -gt 0 ]; then
     exit 1
 elif [ "$WARN" -gt 0 ]; then
     echo -e "${YELLOW}Environment has warnings. Review WARNs above.${NC}"
-    echo "If all WARNs are expected (e.g., prism/env/ not yet implemented),"
-    echo "the environment is ready for the next setup step."
+    echo "If all WARNs are expected (e.g. hyperparams.json missing) the environment is ready for the next setup step."
     exit 0
 else
     echo -e "${GREEN}All checks passed. Ready to train.${NC}"

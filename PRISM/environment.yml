@@ -15,14 +15,17 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - numpy<2.0           # nuplan-devkit requires numpy<2
+  - numpy<2.0           # conda pre-built binary; re-pinned in pip section to block upgrades to 2.x
   - scipy
   - matplotlib
   - pyyaml
   - pip:
+    - numpy<2.0           # re-pin for pip — prevents nuplan-devkit install_requires from upgrading to 2.x
+    - opencv-python<5.0   # 5.x requires CXXABI_1.3.15 not available on most lab systems
     - stable-baselines3>=2.0.0
     - tensorboard
     - wandb
+    - hydra-core>=1.2,<2.0
     # torch is intentionally omitted — install with correct CUDA version:
     #   pip install torch --index-url https://download.pytorch.org/whl/cu121
     # nuplan-devkit is intentionally omitted — install via:

@@ -81,13 +81,22 @@ setup: environment.yml
 	    --index-url https://download.pytorch.org/whl/$(TORCH_CUDA_VERSION)
 	@echo ""
 	@echo "── Installing nuplan-devkit dependencies ──"
-	conda run -n $(CONDA_ENV) pip install -r $(NUPLAN_DEVKIT_PATH)/requirements.txt
+	@echo "   (filtering hydra-core — already pinned in environment.yml at a working version)"
+	grep -vE "^(hydra-core|opencv-python|numpy)" $(NUPLAN_DEVKIT_PATH)/requirements.txt > /tmp/nuplan_req_filtered.txt
+	conda run -n $(CONDA_ENV) pip install -r /tmp/nuplan_req_filtered.txt --prefer-binary
+	@echo ""
+	@echo "── Installing CaRL nuplan dependencies ──"
+	grep -vE "^(hydra-core|opencv-python|numpy)" ../nuPlan/requirements_nuplan.txt > /tmp/carl_nuplan_req_filtered.txt
+	conda run -n $(CONDA_ENV) pip install -r /tmp/carl_nuplan_req_filtered.txt --prefer-binary
+	@echo ""
+	@echo "── Installing CaRL dependencies ──"
+	conda run -n $(CONDA_ENV) pip install -r ../nuPlan/requirements_carl.txt --prefer-binary
 	@echo ""
 	@echo "── Installing nuplan-devkit ──"
-	conda run -n $(CONDA_ENV) pip install -e $(NUPLAN_DEVKIT_PATH)
+	conda run -n $(CONDA_ENV) pip install -e $(NUPLAN_DEVKIT_PATH) --prefer-binary
 	@echo ""
 	@echo "── Installing CaRL (carl_nuplan) ──"
-	conda run -n $(CONDA_ENV) pip install -e ../nuPlan
+	conda run -n $(CONDA_ENV) pip install -e ../nuPlan --prefer-binary
 	@echo ""
 	@echo "── Installing PRISM package ──"
 	conda run -n $(CONDA_ENV) pip install -e .
