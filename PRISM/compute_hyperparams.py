@@ -166,24 +166,27 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
 
     # nuPlan computes rear_axle_acceleration_2d as (v_{t+1}-v_t)/dt internally,
     # so it is already one finite difference of velocity.  Differencing again for
-    # jerk amplifies noise.  A Savitzky-Golay filter (window=5, poly=2) smooths
-    # the acceleration while preserving the signal shape before the final diff.
+    # jerk amplifies noise.  Similarly, heading finite-differencing for delta_psi
+    # is one differentiation of a noisy angle signal.  A Savitzky-Golay filter
+    # (window=7, poly=2) smooths both signals before the final differentiation,
+    # preserving the underlying physical shape while suppressing 10 Hz sample noise.
     try:
         from scipy.signal import savgol_filter
         _wl = min(7, n_iter if n_iter % 2 == 1 else n_iter - 1)  # must be odd
         _wl = max(_wl, 5)
-        a_lon_s = savgol_filter(a_lon, window_length=_wl, polyorder=2)
-        a_lat_s = savgol_filter(a_lat, window_length=_wl, polyorder=2)
+        a_lon_s   = savgol_filter(a_lon,     window_length=_wl, polyorder=2)
+        a_lat_s   = savgol_filter(a_lat,     window_length=_wl, polyorder=2)
+        head_s    = savgol_filter(head_arr,  window_length=_wl, polyorder=2)
     except Exception:
-        a_lon_s, a_lat_s = a_lon, a_lat
+        a_lon_s, a_lat_s, head_s = a_lon, a_lat, head_arr
 
     j_lon = np.gradient(a_lon_s, _DT)
     j_lat = np.gradient(a_lat_s, _DT)
 
     # angular_velocity is not stored in the nuPlan mini DB and returns 0.0.
-    # Detect this and fall back to finite differences of heading.
+    # Detect this and fall back to finite differences of (smoothed) heading.
     if np.max(np.abs(ang_vel)) < 1e-5:
-        delta_psi = np.abs(np.gradient(head_arr, _DT))
+        delta_psi = np.abs(np.gradient(head_s, _DT))
     else:
         delta_psi = np.abs(ang_vel)
     d_lat = np.zeros(n_iter)  # expert data stays in-lane; use 0 as default
