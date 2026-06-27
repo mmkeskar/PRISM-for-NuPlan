@@ -33,7 +33,7 @@ TORCH_CUDA_VERSION ?= cu121
 PYTHON            := python
 
 .PHONY: all setup check-env check cache cache-mini hyperparams hyperparams-mini \
-        train train-mini test clean help
+        check-hyperparams train train-mini test clean help
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default target
@@ -49,7 +49,8 @@ help:
 	@echo "  make setup              One-time environment setup"
 	@echo "  make check              Verify environment is ready"
 	@echo "  make cache-mini         Build cache from mini dataset"
-	@echo "  make hyperparams-mini   Compute hyperparams (mini, ~50 rollouts)"
+	@echo "  make hyperparams-mini   Compute hyperparams (mini, 200 rollouts)"
+	@echo "  make check-hyperparams  Validate hyperparams.json (PASS/FAIL per value)"
 	@echo "  make train-mini         Smoke-test training on mini dataset"
 	@echo "  make cache              Build cache from full train dataset"
 	@echo "  make hyperparams        Compute hyperparams (full, 200 rollouts)"
@@ -143,18 +144,25 @@ cache:
 	    --workers 8
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hyperparameters — mini (fast approximation, 20 rollouts)
+# Hyperparameters — mini (200 rollouts; fast enough, better tail statistics)
 # ─────────────────────────────────────────────────────────────────────────────
 
 hyperparams-mini:
 	@echo "── Computing hyperparams from mini dataset ──"
 	$(PYTHON) compute_hyperparams.py \
 	    --output_path      hyperparams.json \
-	    --n_warmup_rollouts 20 \
+	    --n_warmup_rollouts 200 \
 	    --nuplan_data_root  $(NUPLAN_MINI_ROOT)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hyperparameters — full (200 IDM rollouts as per CLAUDE.md)
+# Hyperparameter validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+check-hyperparams:
+	@bash scripts/check_hyperparams.sh
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hyperparameters — full (200 rollouts as per CLAUDE.md)
 # ─────────────────────────────────────────────────────────────────────────────
 
 hyperparams:
