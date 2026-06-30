@@ -508,8 +508,7 @@ def parse_args():
         help=(
             "Override the model_backend field in the config file. "
             "Useful for quick backend switches without swapping the whole config. "
-            "Note: ba
-            ckend-specific hyperparams (alpamayo_obs, alpamayo.*) must "
+            "Note: backend-specific hyperparams (alpamayo_obs, alpamayo.*) must "
             "still be present in the config file for the chosen backend."
         ),
     )

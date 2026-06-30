@@ -440,6 +440,7 @@ class PRISMEnv(EnvironmentWrapper):
         # Extract style reward and safety cost from info (set by PRISMRewardBuilder)
         r_vec = info.pop("style_reward", np.zeros(_REWARD_DIM, dtype=np.float64))
         c_t = float(info.pop("safety_cost", 0.0))
+        info["safety_cost"] = c_t  # re-expose so trainer can accumulate per-step costs
 
         # z_{t+1} = z_t + gamma^t * r_t
         zt_next = self._zt + (self._gamma ** self._t) * np.asarray(r_vec, dtype=np.float64)
@@ -466,7 +467,6 @@ class PRISMEnv(EnvironmentWrapper):
         # Expose episode z_T for CVaR computation
         if termination or truncation:
             info["episode_zt"] = self._zt.copy()
-            info["episode_cost"] = float(c_t)
 
         return obs, effective_reward, termination, truncation, info
 

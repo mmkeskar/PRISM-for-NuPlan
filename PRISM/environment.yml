@@ -22,6 +22,7 @@ dependencies:
   - pip:
     - numpy<2.0           # re-pin for pip — prevents nuplan-devkit install_requires from upgrading to 2.x
     - opencv-python<5.0   # 5.x requires CXXABI_1.3.15 not available on most lab systems
+    - gym==0.26.2            # CaRL's PPO policy imports legacy gym (not gymnasium)
     - stable-baselines3>=2.0.0
     - tensorboard
     - wandb
