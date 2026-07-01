@@ -21,6 +21,11 @@ prism/
 ├── CLAUDE.md                   ← this file (read first, always)
 ├── hyperparams.json            ← cached hyperparameters (auto-generated)
 ├── compute_hyperparams.py      ← run once before any training
+│                                  uses collect_expert_rollouts() — nuPlan log
+│                                  replay, NOT simulated IDM (avoids cache
+│                                  chicken-and-egg; expert logs are equivalent
+│                                  for calibration purposes)
+├── handoff.md                  ← session handoff notes (updated each session)
 ├── docs/
 │   ├── prism_paper.tex         ← full paper draft
 │   └── references.bib
@@ -42,7 +47,9 @@ prism/
 ├── scripts/
 │   ├── train.py                ← main training entry point
 │   ├── evaluate.py             ← evaluation on nuPlan Val14
-│   └── visualise_pareto.py     ← plot the distributional Pareto front
+│   ├── visualise_pareto.py     ← plot the distributional Pareto front
+│   ├── check_hyperparams.sh    ← thin bash wrapper: file existence only
+│   └── check_hyperparams.py    ← Python validation: PASS/WARN/FAIL per value
 ├── configs/
 │   └── prism_default.yaml      ← all training hyperparameters
 └── tests/
@@ -77,13 +84,28 @@ prism/
 
 ### nuPlan
 - **Repo**: https://github.com/motional/nuplan-devkit
-- **What we use**: closed-loop simulation, scenario database, IDM planner
-  for warm-up rollouts, Val14 evaluation protocol
+- **What we use**: closed-loop simulation, scenario database, expert log
+  replay for hyperparameter calibration, Val14 evaluation protocol
 - **Install**: follow nuplan-devkit README for dataset setup
 - **Key classes**:
-  - `nuplan.planning.simulation.planner.idm_planner.IDMPlanner`
+  - `nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder.NuPlanScenarioBuilder`
+  - `nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter`
   - `nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario`
   - nuPlan metrics: `nuplan.planning.metrics`
+- **NuPlanScenarioBuilder constructor** — must pass these kwargs (match `build_cache.py`):
+  ```python
+  NuPlanScenarioBuilder(
+      data_root=..., map_root=...,
+      sensor_root=nuplan_data_root,  # required even if unused
+      db_files=None, map_version="nuplan-maps-v1.0",
+      include_cameras=False, max_workers=1, verbose=False,
+  )
+  ```
+- **angular_velocity caveat**: `DynamicCarState.angular_velocity` returns 0.0
+  for all ego states in the nuPlan **mini** dataset. Detect with
+  `np.max(np.abs(ang_vel)) < 1e-5` and fall back to finite-diff of heading.
+- **Env var name**: `NUPLAN_MAPS_ROOT` (with S) not `NUPLAN_MAP_ROOT` — check
+  lab.env and Makefile carefully; mismatch causes silent wrong-path errors.
 
 ### Stable-Baselines3
 - **Package**: `stable-baselines3`
@@ -199,8 +221,15 @@ R_t = gamma^{-t} * [f_theta_k(z_{t+1}) - f_theta_k(z_t)]
 python compute_hyperparams.py \
     --output_path hyperparams.json \
     --n_warmup_rollouts 200 \
-    --nuplan_data_root /path/to/nuplan \
+    --nuplan_data_root /path/to/nuplan/nuplan-v1.1-mini \
     --gamma 0.99
+```
+
+Or via Makefile (preferred):
+```bash
+source lab.env && conda activate prism
+make hyperparams-mini    # mini dataset, 200 rollouts (~minutes)
+make check-hyperparams   # validate values with PASS/WARN/FAIL output
 ```
 
 ### In training script — guard pattern:
@@ -220,9 +249,14 @@ if result.returncode != 0:
 from prism.utils.hyperparams import load_hyperparams
 hp = load_hyperparams("hyperparams.json")
 sigma_j_sq = hp["reward_scaling"]["sigma_j_sq"]
-epsilon_curve = hp["epsilon_curve"]   # dict: "0.95" -> float
+epsilon_curve = hp["epsilon_curve"]   # dict: "0.95" -> float  (keys are STRINGS)
 lead_times = hp["lead_times"]         # nested dict
 ```
+
+### epsilon_curve property
+`epsilon_curve` is **monotone increasing** with alpha. `CVaR_alpha` increases
+as alpha increases (stricter quantile → smaller tail → higher tail mean).
+Verify with `make check-hyperparams` after recomputing.
 
 ---
 
@@ -252,9 +286,11 @@ Each policy is trained independently with its own lambda_k.
 1. **No CaRL weight initialisation**: policies train from scratch.
    Rationale: CaRL's scalar reward would bias the style objectives.
 
-2. **IDM warm-up, not random rollouts**: hyperparams computed from IDM
-   episodes, not random policy. Rationale: random policy produces
-   degenerate trajectories skewed to zero returns.
+2. **Expert log replay, not random rollouts**: hyperparams computed from
+   nuPlan expert trajectories (`collect_expert_rollouts`), not random
+   policy or simulated IDM. Rationale: random policy produces degenerate
+   trajectories; expert replay avoids the cache chicken-and-egg problem
+   (no built cache needed) while providing realistic kinematic statistics.
 
 3. **Episode-level cap for persistent indicators**: TTC, THW, speed
    violation costs are capped per episode. Rationale: prevents
@@ -292,6 +328,7 @@ Each policy is trained independently with its own lambda_k.
 | z_t normalisation | `prism/utils/zt_normaliser.py` |
 | Hyperparam loading | `prism/utils/hyperparams.py` |
 | Hyperparam computation | `compute_hyperparams.py` (root level) |
+| Hyperparam validation | `scripts/check_hyperparams.sh` + `scripts/check_hyperparams.py` |
 | Main training loop | `scripts/train.py` |
 | Evaluation | `scripts/evaluate.py` |
 
@@ -310,8 +347,9 @@ Each policy is trained independently with its own lambda_k.
 1. Edit `prism/env/safety_cost.py`
 2. Update `INDICATOR_OUTCOME_MAP` or `OUTCOME_WEIGHTS` in
    `compute_hyperparams.py` if adding new signals
-3. Delete `hyperparams.json` and rerun `compute_hyperparams.py`
-4. Update Table I in `docs/prism_paper.tex`
+3. Delete `hyperparams.json` and rerun `make hyperparams-mini`
+4. Run `make check-hyperparams` to validate the new values
+5. Update Table I in `docs/prism_paper.tex`
 
 ### Change the alpha curriculum
 1. Edit `prism/curriculum/alpha_schedule.py`
@@ -340,6 +378,17 @@ Each policy is trained independently with its own lambda_k.
 - **EMA beta = 0.01** for z_t normalisation update during training.
 - **Blind spot geometry**: defined as ±45° to ±135° from ego heading,
   within 10m longitudinal and 4m lateral of ego centre.
+- **epsilon_curve keys are strings**: JSON keys for epsilon_curve are e.g.
+  `"0.95"` not `0.95`. Always use `str(round(alpha, 2))` as the lookup key.
+- **epsilon_curve is monotone increasing**: `CVaR_alpha` increases with alpha.
+  A curve that decreases indicates a bug in safety cost collection.
+- **angular_velocity not in mini DB**: `DynamicCarState.angular_velocity`
+  returns 0.0 for all ego states in the nuPlan mini dataset. Fall back to
+  `np.gradient(savgol_filter(heading_array, 7, 2), dt)`.
+- **Jerk computation**: do NOT triple-difference position. Use
+  `rear_axle_acceleration_2d` from `DynamicCarState`, apply
+  `scipy.signal.savgol_filter(window=7, polyorder=2)`, then one
+  `np.gradient` call. Triple-differencing amplifies noise by ~1000×.
 
 ---
 
@@ -348,18 +397,46 @@ Each policy is trained independently with its own lambda_k.
 ```
 nuplan-devkit          # nuPlan simulation and data
 stable-baselines3      # PPO implementation
-torch                  # neural networks
+torch                  # neural networks (GPU via conda/pip CUDA wheel)
 numpy
 scipy
 matplotlib             # Pareto front visualisation
 wandb                  # experiment tracking (optional)
+gym==0.26.2            # CRITICAL: must be exactly 0.26.2
+                       # newer gym breaks the step() return signature
+                       # (returns 5-tuple; CaRL/nuPlan wrappers expect 4-tuple)
 ```
 
-Install:
+### Setup pipeline (run in order, once per machine)
+
 ```bash
-pip install stable-baselines3 torch numpy scipy matplotlib
-# nuplan-devkit: follow https://github.com/motional/nuplan-devkit
+# 1. Set machine-local paths (edit lab.env first)
+source lab.env
+
+# 2. Create conda env, install all dependencies
+make setup              # installs PyTorch, nuplan-devkit, CaRL, PRISM
+
+# 3. Verify environment
+make check              # runs scripts/lab_check.sh
+
+# 4. Build scenario cache (required for training; takes minutes for mini)
+make cache-mini         # mini dataset (~500 scenarios, fast)
+make cache              # full training set (hours, run once)
+
+# 5. Compute hyperparameters (must run before any training)
+make hyperparams-mini   # 200 rollouts from mini dataset (~minutes)
+make check-hyperparams  # validate with PASS/WARN/FAIL output
+
+# 6. Smoke-test training
+make train-mini         # K=2 policies, mini dataset
+
+# 7. Full training
+make train              # K=5 policies, full dataset
 ```
+
+`make setup` handles: conda env creation, PyTorch CUDA wheel, nuplan-devkit,
+CaRL dependencies, and `pip install -e .` for the PRISM package itself. See
+`Makefile` and `environment.yml` for pinned versions.
 
 ---
 
@@ -372,6 +449,9 @@ pip install stable-baselines3 torch numpy scipy matplotlib
 - Do not use CaRL's reward function
 - Do not hardcode scaling parameters -- always read from hyperparams.json
 - Do not compute CVaR at timestep level -- always at trajectory level
+- Do not add inline comments after values in `lab.env` — GNU Make parses
+  `VAR=value   # comment` as the value including trailing spaces and the `#`.
+  Put all comments on their own line.
 
 ---
 

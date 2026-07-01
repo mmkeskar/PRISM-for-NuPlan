@@ -36,6 +36,7 @@ make check-env       # validates paths and file types, no conda required
 | `MINI_CACHE_PATH` | Output path for mini scenario cache |
 | `CONDA_ENV` | Conda environment name (default: `prism`) |
 | `TORCH_CUDA_VERSION` | CUDA version for PyTorch wheel (e.g. `cu124`) |
+| `NUPLAN_SENSOR_ROOT` | Path to sensor blob directory (camera JPEGs) — Alpamayo only; harmless if unset for CaRL |
 
 Check your CUDA version: `nvidia-smi | grep "CUDA Version"`
 
@@ -74,12 +75,14 @@ takes a few minutes). Update `cache_path` in your training config to match.
 ### Step 6 — Compute hyperparameters
 
 ```bash
-make hyperparams-mini
+make hyperparams-mini   # 200 expert log rollouts on mini set (~minutes)
+make check-hyperparams  # validate with colour-coded PASS/WARN/FAIL output
 ```
 
-Runs 20 IDM warm-up rollouts on the mini set — fast approximation sufficient to
-start a smoke-test run. Use `make hyperparams` (200 rollouts, full dataset) before
-a real training run.
+`hyperparams-mini` replays 200 nuPlan expert trajectories to calibrate reward
+scaling, safety cost weights, and the CVaR epsilon curve. All values must pass
+`check-hyperparams` before training. Use `make hyperparams` (full dataset) before
+a real training run if mini statistics look marginal.
 
 ### Step 7 — Smoke-test training
 
@@ -115,8 +118,9 @@ Or with explicit `python` commands — see the Manual section below.
 | `make check` | Verify environment, imports, data paths, GPU |
 | `make cache-mini` | Build cache from mini dataset (500 scenarios) |
 | `make cache` | Build cache from full training split |
-| `make hyperparams-mini` | Compute hyperparams from mini (20 rollouts) |
-| `make hyperparams` | Compute hyperparams from full dataset (200 rollouts) |
+| `make hyperparams-mini` | Compute hyperparams from mini (200 expert rollouts) |
+| `make check-hyperparams` | Validate hyperparams.json — PASS/WARN/FAIL per value |
+| `make hyperparams` | Compute hyperparams from full dataset (200 expert rollouts) |
 | `make train-mini` | Smoke-test training on mini cache (K=2) |
 | `make train` | Full PRISM training run |
 | `make test` | Run unit tests |
@@ -126,80 +130,6 @@ Any variable can be overridden on the command line:
 ```bash
 make cache NUPLAN_DATA_ROOT=/my/path CACHE_PATH=/my/cache
 ```
-
----
-
-## Prerequisites (manual setup)
-
-Use this section if you need to run steps individually outside of `make`.
-
-### 1. Create conda environment
-
-```bash
-conda env create -f environment.yml
-conda activate prism
-```
-
-nuplan-devkit 1.2.x requires Python 3.10+ and `numpy<2.0` — both pinned in `environment.yml`.
-
-### 2. Install remaining packages
-
-```bash
-# PyTorch with CUDA — match to your driver
-source lab.env
-pip install torch --index-url https://download.pytorch.org/whl/$TORCH_CUDA_VERSION
-
-# nuplan-devkit from source
-pip install -e $NUPLAN_DEVKIT_PATH
-
-# PRISM package
-pip install -e .
-```
-
-**Alpamayo only:**
-```bash
-pip install transformers    # backbone loading
-pip install peft            # Phase B LoRA fine-tuning only
-```
-
-### 3. Set data paths
-
-```bash
-source lab.env
-```
-
-**Alpamayo only** — sensor blob root for JPEG camera images:
-```bash
-export NUPLAN_SENSOR_ROOT=/data/nuplan/sensor_blobs
-```
-If `NUPLAN_SENSOR_ROOT` is not set, the camera observation builder returns zero
-frames and logs a warning. Training proceeds structurally but without real images.
-
-### 4. Build the scenario cache
-
-```bash
-python scripts/build_cache.py \
-    --data_root  $NUPLAN_MINI_ROOT \
-    --map_root   $NUPLAN_MAP_ROOT \
-    --cache_path $MINI_CACHE_PATH \
-    --workers    4
-```
-
-`build_cache.py` reads directly from nuPlan `.db` files — no Hydra or YAML
-configs required. Update `cache_path` in your training config to match.
-
-### 5. Compute hyperparameters
-
-```bash
-python compute_hyperparams.py \
-    --output_path hyperparams.json \
-    --n_warmup_rollouts 200 \
-    --nuplan_data_root $NUPLAN_DATA_ROOT \
-    --gamma 0.99
-```
-
-All training commands guard against a missing `hyperparams.json` and will exit
-with a clear error if this step was skipped.
 
 ---
 
