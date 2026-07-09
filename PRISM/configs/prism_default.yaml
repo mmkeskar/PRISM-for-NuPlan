@@ -54,6 +54,8 @@ stage2:
 # CVaR Lagrangian
 eta_lambda: 0.01                # dual step size
 cvar_buffer_size: 500           # rolling window of episodes for CVaR estimation
+lambda_warmup_updates: 500      # hold lambda=0 for first N updates (policy warmup)
+lambda_max: 50.0                # cap on Lagrange multiplier (prevents PPO gradient collapse)
 
 # Alpha curriculum (tightens CVaR constraint over training)
 alpha_start: 0.20

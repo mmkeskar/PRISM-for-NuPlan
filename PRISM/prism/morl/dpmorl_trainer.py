@@ -121,9 +121,11 @@ class DPMORLTrainer:
             alpha_end=cfg.get("alpha_end", 0.95),
             n_curriculum=cfg.get("n_curriculum_iters", 5000),
         )
+        self._lambda_warmup = cfg.get("lambda_warmup_updates", 0)
         self.lagrangian = CVaRLagrangian(
             eta_lambda=cfg.get("eta_lambda", 0.01),
             buffer_size=cfg.get("cvar_buffer_size", 500),
+            lambda_max=cfg.get("lambda_max", float("inf")),
         )
 
         self._global_step = 0
@@ -208,18 +210,25 @@ class DPMORLTrainer:
             # ── PPO update ─────────────────────────────────────────────
             self._ppo_update(next_obs)
 
-            # ── Lagrangian update ──────────────────────────────────────
-            new_lambda, cvar_hat = self.lagrangian.update_lambda(alpha, epsilon)
-            self.env.set_lambda(new_lambda)
-
-            summary["lambda_history"].append(new_lambda)
-            summary["cvar_history"].append(cvar_hat)
+            # ── Lagrangian update (hold lambda=0 during warmup) ────────
+            if update < self._lambda_warmup:
+                self.env.set_lambda(0.0)
+                summary["lambda_history"].append(0.0)
+                summary["cvar_history"].append(self.lagrangian.estimate_cvar(alpha))
+            else:
+                new_lambda, cvar_hat = self.lagrangian.update_lambda(alpha, epsilon)
+                self.env.set_lambda(new_lambda)
+                summary["lambda_history"].append(new_lambda)
+                summary["cvar_history"].append(cvar_hat)
 
             if (update + 1) % 100 == 0:
+                _lam = summary["lambda_history"][-1] if summary["lambda_history"] else 0.0
+                _cvar = summary["cvar_history"][-1] if summary["cvar_history"] else 0.0
+                _warmup_tag = " [warmup]" if update < self._lambda_warmup else ""
                 logger.info(
-                    f"[Policy {self.policy_id}] update={update+1}/{n_updates}  "
-                    f"alpha={alpha:.2f}  epsilon={epsilon:.3f}  "
-                    f"CVaR={cvar_hat:.3f}  lambda={new_lambda:.4f}"
+                    f"[Policy {self.policy_id}] update={update+1}/{n_updates}"
+                    f"{_warmup_tag}  alpha={alpha:.2f}  epsilon={epsilon:.3f}  "
+                    f"CVaR={_cvar:.3f}  lambda={_lam:.4f}"
                 )
 
             if (update + 1) % self.cfg.get("save_every", 500) == 0:

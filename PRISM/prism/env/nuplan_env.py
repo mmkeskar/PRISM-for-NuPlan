@@ -28,7 +28,7 @@ at every step so the utility function transformation is well-conditioned.
 from __future__ import annotations
 
 import math
-import traceback
+from collections import deque
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -76,6 +76,10 @@ from prism.utils.zt_normaliser import ZtNormaliser
 _REWARD_DIM = 4      # (comfort, progress, lateral, spacing)
 _DT = 0.1            # nuPlan simulation timestep [s]
 
+# Collision type classification
+_VRU_TYPES = {TrackedObjectType.PEDESTRIAN, TrackedObjectType.BICYCLE}
+_VEHICLE_TYPES = {TrackedObjectType.VEHICLE}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRISMRewardBuilder
@@ -107,16 +111,22 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         self._safety = SafetyCostBuilder(hp)
 
         # Episode state
-        self._prev_accel_lon: Optional[float] = None
-        self._prev_accel_lat: Optional[float] = None
+        self._prev_accel_lon_smooth: Optional[float] = None
+        self._prev_accel_lat_smooth: Optional[float] = None
+        # Rolling buffers for Savitzky-Golay jerk smoothing (window up to 7)
+        self._accel_lon_buf: deque = deque(maxlen=7)
+        self._accel_lat_buf: deque = deque(maxlen=7)
+
         self._prev_collided_tokens: list = []
         self._expert_rl_infractions: list = []
         self._episode_step: int = 0
 
     def reset(self) -> None:
         self._safety.reset()
-        self._prev_accel_lon = None
-        self._prev_accel_lat = None
+        self._prev_accel_lon_smooth = None
+        self._prev_accel_lat_smooth = None
+        self._accel_lon_buf.clear()
+        self._accel_lat_buf.clear()
         self._prev_collided_tokens = []
         self._expert_rl_infractions = []
         self._episode_step = 0
@@ -157,14 +167,39 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         except Exception:
             a_lon, a_lat = 0.0, 0.0
 
-        # Jerk = Δa / Δt
-        if self._prev_accel_lon is not None:
-            j_lon = (a_lon - self._prev_accel_lon) / _DT
-            j_lat = (a_lat - self._prev_accel_lat) / _DT
+        # Lateral velocity (ego frame) for blind spot lane-change gate
+        try:
+            v2d = state.rear_axle_velocity_2d
+            heading = ego_state.center.heading
+            v_lat_ego = float(
+                -math.sin(heading) * v2d.x + math.cos(heading) * v2d.y
+            )
+        except Exception:
+            v_lat_ego = 0.0
+
+        # ── Jerk via SG-smoothed acceleration ────────────────────────────
+        # Apply Savitzky-Golay filter to the rolling acceleration buffer before
+        # differentiating, consistent with compute_hyperparams.py calibration.
+        self._accel_lon_buf.append(a_lon)
+        self._accel_lat_buf.append(a_lat)
+
+        buf_len = len(self._accel_lon_buf)
+        if buf_len >= 5:
+            from scipy.signal import savgol_filter
+            # Window must be odd and <= buffer length
+            wl = buf_len if buf_len % 2 == 1 else buf_len - 1
+            a_lon_smooth = float(savgol_filter(list(self._accel_lon_buf), wl, 2)[-1])
+            a_lat_smooth = float(savgol_filter(list(self._accel_lat_buf), wl, 2)[-1])
+        else:
+            a_lon_smooth, a_lat_smooth = a_lon, a_lat
+
+        if self._prev_accel_lon_smooth is not None:
+            j_lon = (a_lon_smooth - self._prev_accel_lon_smooth) / _DT
+            j_lat = (a_lat_smooth - self._prev_accel_lat_smooth) / _DT
         else:
             j_lon, j_lat = 0.0, 0.0
-        self._prev_accel_lon = a_lon
-        self._prev_accel_lat = a_lat
+        self._prev_accel_lon_smooth = a_lon_smooth
+        self._prev_accel_lat_smooth = a_lat_smooth
 
         # ── Lateral deviation and heading error ──────────────────────────
         d_lat, delta_psi = self._lateral_quantities(ego_state, current_lane)
@@ -172,7 +207,7 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         # ── Lane position ────────────────────────────────────────────────
         lane_index, n_lanes = self._lane_position(ego_state, map_cache, current_lane)
 
-        # ── Collision detection ──────────────────────────────────────────
+        # ── Collision detection and classification ───────────────────────
         had_collision, collided_tokens = calculate_non_stationary_collisions(
             ego_state,
             detection_cache.tracked_objects,
@@ -181,17 +216,25 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         self._prev_collided_tokens.extend(collided_tokens)
 
         had_vru_collision = False
+        had_vehicle_collision = False
+        had_object_collision = False
         if had_collision:
-            had_vru_collision = self._check_vru_collision(
-                ego_state, detection_cache, collided_tokens
-            )
+            for obj in detection_cache.tracked_objects:
+                if obj.track_token not in collided_tokens:
+                    continue
+                if obj.tracked_object_type in _VRU_TYPES:
+                    had_vru_collision = True
+                elif obj.tracked_object_type in _VEHICLE_TYPES:
+                    had_vehicle_collision = True
+                else:
+                    had_object_collision = True
 
         # ── Off-road ─────────────────────────────────────────────────────
         is_off_road, _ = _calculate_off_road(
             ego_state, map_cache, intersecting_lanes, violation_threshold=0.0
         )
 
-        # ── Red light ────────────────────────────────────────────────────
+        # ── Red light (outcome event) ─────────────────────────────────────
         ran_red_light, self._expert_rl_infractions = _calculate_red_light(
             simulation_wrapper, map_cache, current_lane, self._expert_rl_infractions
         )
@@ -221,15 +264,17 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
             ego_state=ego_state,
             detection_cache=detection_cache,
             map_cache=map_cache,
-            had_collision=had_collision,
+            had_vru_collision=had_vru_collision,
+            had_vehicle_collision=had_vehicle_collision,
+            had_object_collision=had_object_collision,
             is_off_road=is_off_road,
             ran_red_light=ran_red_light,
-            had_vru_collision=had_vru_collision,
             had_wrong_direction=had_wrong_direction,
             v_lead=regime_result.v_lead,
             d_lead=regime_result.d_lead,
             has_lead=regime_result.has_lead,
             v_limit=regime_result.v_limit,
+            v_lat_ego=v_lat_ego,
         )
 
         # ── Termination ───────────────────────────────────────────────────
@@ -331,19 +376,6 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
             return lane_index, n_lanes
         except Exception:
             return 0, 1
-
-    @staticmethod
-    def _check_vru_collision(ego_state, detection_cache, collided_tokens: list) -> bool:
-        """Return True if any collided object is a VRU (pedestrian or cyclist)."""
-        VRU_TYPES = {TrackedObjectType.PEDESTRIAN, TrackedObjectType.BICYCLE}
-        try:
-            for obj in detection_cache.tracked_objects:
-                if obj.track_token in collided_tokens:
-                    if obj.tracked_object_type in VRU_TYPES:
-                        return True
-        except Exception:
-            pass
-        return False
 
     @staticmethod
     def _check_wrong_direction(ego_state, current_lane) -> bool:
@@ -503,6 +535,8 @@ def make_prism_env(
         environment_area=environment_area,
         hp=hp,
         regime_detector=regime_detector,
+        terminate_on_collision=terminate_on_failure,
+        terminate_on_off_road=terminate_on_failure,
     )
     return PRISMEnv(
         scenario_sampler=scenario_sampler,

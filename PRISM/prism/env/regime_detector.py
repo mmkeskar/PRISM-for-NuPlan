@@ -201,7 +201,7 @@ class RegimeDetector:
         if speeds:
             return float(np.mean(speeds))
         # No surrounding vehicles; treat as free-flow
-        return self.DEFAULT_SPEED_LIMIT_MPS
+        return float("inf") #guarantees congestion check is False, with no cars, lead check is False, so free-flow will be returned
 
     @staticmethod
     def _ego_basis(ego_state) -> Tuple[float, float]:

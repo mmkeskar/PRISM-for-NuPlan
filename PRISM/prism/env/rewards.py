@@ -162,7 +162,7 @@ def compute_style_rewards(
     r_lateral = compute_lateral_discipline(
         d_lat=d_lat,
         delta_psi=delta_psi,
-        sigma_d=hp.get("floor_values", {}).get("delta_d", 0.2),
+        sigma_d=scaling.get("sigma_d", 0.2),
         phi=scaling["phi"],
     )
     ttc = compute_ttc(d_lead=d_lead, v_ego=v_ego, v_lead=v_lead, has_lead=has_lead)

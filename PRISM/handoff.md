@@ -1,23 +1,23 @@
 # PRISM Session Handoff
 
-**Date:** 2026-06-30
+**Date:** 2026-07-08
 
 **Session type:** Development / debugging
 
-**Topic:** Debugged and fixed the full training pipeline from `make cache-mini` through `make train-mini`, resolving a cascade of environment, library, and logic bugs to reach a running training loop with an active Lagrangian.
+**Topic:** Comprehensive reward pipeline audit and fix: resolved 13 code-vs-paper discrepancies across the safety cost, reward functions, epsilon calibration, training loop, and Lagrangian control. All fixes implemented but not yet tested or pushed to GitHub.
 
 ---
 
 ## Current Project State
 
-**Current milestone:** Get `make hyperparams-mini && make train-mini` running cleanly end-to-end on the lab machine.
+**Current milestone:** Get `make hyperparams-mini && make train-mini` running cleanly end-to-end with a converging Lagrangian.
 
 - `make setup` — complete and verified
 - `make check` — passing for all modules including `prism.env.nuplan_env`
 - `make cache-mini` — **complete**: 500/500 scenarios cached to `/data/prism_mini_cache`
-- `make hyperparams-mini` — complete with 200 rollouts; values mostly in range (phi=0.42 still a WARN, deferred — see Open Questions)
-- `make check-hyperparams` — passing (phi warns, does not fail)
-- `make train-mini` — **blocked**: K=2 policies, 10000 updates each. Pipeline runs without errors. CVaR and lambda are non-zero (safety cost path confirmed working). However, lambda diverges without bound (reached 1182 at update 500) and CVaR does not fall — the Lagrangian is not converging. See Open Questions.
+- `make hyperparams-mini` — previously run with 200 rollouts; **must be re-run** after code changes (delete `hyperparams.json` first — calibration logic has changed substantially)
+- `make check-hyperparams` — will need re-run; phi=0.42 was a WARN previously, see Open Questions
+- `make train-mini` — **not yet re-run** after this session's fixes; previous run had lambda divergence (reached 1182 at update 500). Root causes now addressed in code. Needs retesting.
 
 ### Architecture summary
 
@@ -41,72 +41,157 @@ Key paths:
 
 ### Files modified this session
 
-#### `lab.env`
-Three additions to fix runtime environment issues on the lab machine:
+#### `prism/env/safety_cost.py` — complete rewrite (×2 across session)
 
-- **`NUPLAN_MAPS_ROOT`** (new): CaRL's `gym_scenario.py` reads `os.getenv("NUPLAN_MAPS_ROOT")` (with trailing S), not `NUPLAN_MAP_ROOT`. Both are now exported and kept in sync. Missing this caused `TypeError: stat: path should be string … not NoneType` on every scenario load.
-- **`LD_PRELOAD`** (new): Lab machine's system `libstdc++.so.6` lacks `CXXABI_1.3.15`, which conda's ICU/sqlite3 requires. Preloading the conda env's libstdc++ resolves it: `export LD_PRELOAD=/home/mi3/miniconda3/envs/prism/lib/libstdc++.so.6${LD_PRELOAD:+:$LD_PRELOAD}`.
+Fixes for bugs 2, 4, 5, 7, 8, 9 from the audit, plus directional blind spot and combined must-stop indicator:
 
-**Critical gotcha — inline comments in lab.env corrupt Make variables:** The Makefile uses `-include lab.env`, which parses the file as Makefile syntax in addition to bash sourcing it manually. GNU Make preserves whitespace before `#` in variable assignments (bash does not). Any line of the form `export VAR=value   # comment` will set the Make variable to `value   ` (with trailing spaces) even though bash sees a clean value. This caused `os.path.isdir("…/maps   ")` to fail silently while `source lab.env` + `cat -A` looked clean. **All assignment lines in lab.env must have comments on their own preceding line, never inline after a value.**
+**Indicator severity (Bug 2):** `_cap_indicator(name)` now takes `severity: float`. Per-step cost = `w_j * severity`. Graded severities: `s_ttc = (thresh-TTC)/thresh`, `s_thw = (thresh-THW)/thresh`, `s_spd = (v_ego-v_limit)/v_limit`. Previously all indicators fired at flat weight regardless of how far inside the threshold.
 
-#### `environment.yml`
-Added `gym==0.26.2` to the pip section. CaRL's `ppo_model.py` imports the legacy `gym` package (not `gymnasium`). This was missing from the environment and not caught by `make check` because the failing import only triggers when the PPO agent is actually built inside the training loop, not at module import time.
+**Blind spot directionality (Bug 4 + refinement):** `_blind_spot_sides_occupied()` (replaces `_blind_spot_occupied()`) returns `(left_occ, right_occ)` using the signed lateral offset `d_lat_signed = -sin_h*dx + cos_h*dy`. In `compute()`, the indicator only fires when ego is *converging* with the occupied side: `left_occ and v_lat_ego > lc_thresh` OR `right_occ and v_lat_ego < -lc_thresh`. Moving away from an occupied blind spot does not fire.
+
+**Speed violation (Bug 5):** Removed `1 + delta_road` tolerance from speed indicator. Exceeding the legal limit is a violation regardless of road type.
+
+**Stop sign violation — state machine (Bug 7, redesigned):** Old approach was point-in-polygon at time of crossing (unreliable at 10 Hz for thin stripe polygons, vulnerable to speed-blasting). New approach is a CARLA Leaderboard 2.0-style state machine inside `_check_stop_sign_violation()` (instance method, not static):
+- **Encounter:** sign centroid enters approach window `0 < d_lon < approach_m` (default 5m) — start tracking
+- **Track:** record whether `v_ego < stop_threshold_ms (0.5 m/s)` at any point while sign is ahead
+- **Verdict:** when ego passes the sign (`d_lon ≤ 0`), if no stop was recorded → violation, clean up state
+- Stopping after the line does not satisfy the check (approach window tracking ends at the crossing event)
+- State machine lives in `self._stop_sign_state: Dict[str, Dict]`, cleared on `reset()`
+- Stop sign state (`_stop_sign_tokens_fired` set) is no longer tracked externally in `PRISMRewardBuilder`
+
+**Collision weights (Bug 8):** Outcome block now distinguishes `had_vru_collision` (weight 100), `had_vehicle_collision` (weight 80), `had_object_collision` (weight 40) via `elif` chain. Previously all collisions used a single weight.
+
+**Red light indicator → must_stop_ahead (Bug 9 + stop sign combined):** `_red_light_ahead()` renamed to `_must_stop_ahead()`. Now checks both red traffic light connectors (from `map_cache.lane_connectors` + `TrafficLightStatusType.RED`) and stop signs (from `map_cache.stop_lines` with `StopLineType.STOP_SIGN`). Both use `_estimate_time_to_arrival()` with the same `arrival_horizon_s` threshold. `_MAX_LOOKAHEAD_M = 80.0` proximity shortcut skips polygon distance computation for distant targets. `SafetyCostComponents.red_light_ahead_active` renamed to `must_stop_ahead_active`.
+
+**compute() signature change:** Removed `had_stop_sign_violation` parameter — violation is now detected entirely inside `SafetyCostBuilder` via `_check_stop_sign_violation()`.
 
 #### `prism/env/nuplan_env.py`
-Fixed a silent bug where the safety constraint was never active:
 
-- `PRISMEnv.step()` was calling `info.pop("safety_cost", 0.0)` to extract the cost internally, which removed the key from the dict before returning it. The trainer then called `info.get("safety_cost", 0.0)` and always got 0.0. Fix: after popping internally, immediately re-expose: `info["safety_cost"] = c_t`.
-- Removed the stale `info["episode_cost"] = float(c_t)` line at episode end, which was incorrectly exposing only the final-timestep cost as if it were the episode total. The trainer correctly accumulates per-step costs itself via `compute_episode_cost(episode_step_costs, gamma=...)`.
+**SG smoothing for live training (Bug 3):** `PRISMRewardBuilder` now has `_accel_lon_buf` and `_accel_lat_buf` deques (maxlen=7). At each step, acceleration is appended, Savitzky-Golay filter (window up to 7, polyorder=2) applied to the buffer, and jerk computed from the smoothed values. Consistent with `compute_hyperparams.py` calibration. Buffer cleared on `reset()`. Falls back to raw acceleration when buffer has fewer than 5 samples.
+
+**Collision classification (Bug 8):** After `calculate_non_stationary_collisions`, collided tokens are classified by `tracked_object_type` into `had_vru_collision` (`PEDESTRIAN`, `BICYCLE`), `had_vehicle_collision` (`VEHICLE`), or `had_object_collision` (other). Previously all collisions set `had_collision=True` and the caller couldn't distinguish types.
+
+**terminate_on_failure propagation (Bug B):** `make_prism_env()` now passes `terminate_on_collision=terminate_on_failure` and `terminate_on_off_road=terminate_on_failure` to `PRISMRewardBuilder`. Previously `PRISMRewardBuilder` hardcoded `terminate_on_collision=True, terminate_on_off_road=True` regardless of the `terminate_on_failure` flag passed to the env.
+
+**v_lat_ego extraction:** `rear_axle_velocity_2d` projected into ego frame (`-sin_h*vx + cos_h*vy`) and passed to `SafetyCostBuilder.compute()` for the directional blind spot check.
+
+**Removed external stop sign state:** `_stop_sign_tokens_fired` set and `SafetyCostBuilder._stop_sign_violated()` call removed from `PRISMRewardBuilder`. Stop sign violation is now internal to `SafetyCostBuilder`.
+
+**Updated `compute()` call:** `had_stop_sign_violation` argument removed (no longer accepted). Collision args split into `had_vru_collision`, `had_vehicle_collision`, `had_object_collision`.
+
+#### `prism/env/rewards.py`
+
+**sigma_d key bug:** `compute_style_rewards()` was reading `hp.get("floor_values", {}).get("delta_d", 0.2)` as the `sigma_d` argument to `compute_lateral_discipline()`. The key is wrong — `sigma_d` is a reward scaling parameter stored at `reward_scaling["sigma_d"]`, not `floor_values["delta_d"]`. Fixed to `scaling.get("sigma_d", 0.2)`.
+
+#### `prism/morl/cvar_lagrangian.py`
+
+**Lambda cap (Bug C):** Added `lambda_max: float = float("inf")` parameter to `__init__`. `update_lambda()` now applies `min(self._lambda_max, max(0.0, ...))`. Included in `state_dict()` / `from_state_dict()` for checkpoint consistency.
+
+#### `prism/morl/dpmorl_trainer.py`
+
+**Lambda warmup (Bug C):** `_lambda_warmup = cfg.get("lambda_warmup_updates", 0)`. During the first `lambda_warmup_updates` PPO updates, `set_lambda(0.0)` is called and `update_lambda()` is skipped. Episode costs are still accumulated in the CVaR buffer during warmup, so the Lagrangian starts from a realistic distribution when it activates. Improved logging reports `[warmup]` tag and uses `summary` lists instead of undefined `cvar_hat`/`new_lambda` variables from outside the warmup branch.
+
+**Lambda max passed through:** `CVaRLagrangian` now constructed with `lambda_max=cfg.get("lambda_max", float("inf"))`.
+
+#### `compute_hyperparams.py`
+
+**Full safety signal in epsilon calibration (Bug A):** `_extract_episode()` previously only computed TTC and THW costs inline (two channels out of five). Now constructs `SafetyCostBuilder(bootstrap_hp)` per episode and calls `compute()` at each step with all five indicator channels active. Bootstrap indicator weights (computed from fallback lead times) are populated in `bootstrap_hp["indicator_weights"]` / `bootstrap_hp["indicator_caps"]` before passing to `SafetyCostBuilder`. All outcome flags passed as `False` (expert data doesn't crash). `v_lat_ego=float(v_lat_raw[i])` passed for the directional blind spot check. This is the primary fix for the epsilon underestimation bug.
+
+**Discounted z_t normalisation (Bug 6):** `compute_zt_normalisation()` previously used `ep["style_r"].sum(axis=0)` (undiscounted sum). Now uses `(gamma**t * r).sum(axis=0)` — discounted cumulative sum matching how `PRISMEnv.step()` accumulates `z_{t+1} = z_t + gamma^t * r_t`. Added `gamma: float = 0.99` parameter; call in `main()` passes `gamma=args.gamma`.
+
+**`red_light_arrival_horizon_s` added to output:** Safety thresholds in the assembled `hyperparams` dict now include `"red_light_arrival_horizon_s": 4.0`.
+
+#### `configs/prism_default.yaml`
+
+Added under CVaR Lagrangian block:
+```yaml
+lambda_warmup_updates: 500      # hold lambda=0 for first N updates
+lambda_max: 50.0                # cap on Lagrange multiplier
+```
 
 ### Key reference files (unmodified)
 - `scripts/build_cache.py` — authoritative example for `NuPlanScenarioBuilder` and `ScenarioFilter` call signatures
-- `prism/morl/dpmorl_trainer.py` — training loop; logs every 100 updates; lagrangian saved as separate `.json`, not inside `.pth`
-- `prism/morl/cvar_lagrangian.py` — CVaR estimator; episode costs accessed via `state_dict()["costs"]`
-- `../nuPlan/carl_nuplan/planning/gym/cache/gym_scenario.py` — reads `NUPLAN_MAPS_ROOT` (with S) at module level as a constant
+- `../nuPlan/carl_nuplan/planning/gym/environment/reward_builder/default_reward_builder.py` — CaRL's `_calculate_red_light()` (in-polygon check + expert infraction allowlist) and `_calculate_stop_sign()` (stub, not implemented)
+- `CARLA/team_code/reward/criteria/run_stop_sign.py` — CARLA Leaderboard 2.0 stop sign state machine (inspiration for our positive-check approach)
 
 ---
 
 ## Decisions & Reasoning
 
 ### 1. Expert log replay instead of live IDM simulation
-*(carried forward from previous session — still the active decision)*
+*(carried forward — still the active decision)*
 
 **Decision:** `collect_expert_rollouts` replays nuPlan's stored ground-truth ego trajectories rather than running the IDM planner in closed-loop simulation.
 
-**Reason:** `compute_hyperparams.py` must run before the scenario cache exists. Live IDM simulation requires `SimulationRunner` + Hydra — bypassed in `build_cache.py`. Expert trajectories are equivalent for calibration purposes.
+**Reason:** `compute_hyperparams.py` must run before the scenario cache exists. Live IDM simulation requires `SimulationRunner` + Hydra. Expert trajectories are equivalent for calibration purposes.
 
 *Alternatives rejected:* Live IDM (requires Hydra, not cache-free), `PRISMEnv` wrapper (requires cache to exist first).
 
 ### 2. Savitzky-Golay smoothing before differentiation
-*(carried forward — smoothing is applied, phi is still 0.42, unresolved)*
+*(carried forward — smoothing is applied in both calibration and live training)*
 
 **Decision:** Apply `scipy.signal.savgol_filter(window=7, polyorder=2)` to acceleration and heading arrays before computing jerk and heading rate.
 
-**Reason:** `rear_axle_acceleration_2d` is already a finite difference of velocity; differencing again for jerk amplifies noise by 100×. `angular_velocity` is absent from the mini DB, so heading rate requires an additional finite diff. Smoothing brought sigma_j_sq from ~4183 to ~5 (passes). phi went from 0.495 → 0.42 (still WARN, deferred).
+**Reason:** `rear_axle_acceleration_2d` is already a finite difference of velocity; differencing again for jerk amplifies noise by 100×. `angular_velocity` is absent from the mini DB, so heading rate requires an additional finite diff. Smoothing is applied both in `compute_hyperparams.py` (full episode batch) and in `PRISMRewardBuilder` (rolling deque of 7 steps) so calibration and training see the same jerk distribution.
 
 ### 3. No inline comments after assignment values in lab.env
+*(carried forward)*
 
 **Decision:** All comments in `lab.env` must be on their own line above the assignment, never trailing after the value.
 
-**Reason:** The Makefile's `-include lab.env` parses the file as GNU Make syntax. Make preserves whitespace before `#` in variable assignments, so `VAR=value   # comment` sets Make's variable to `value   ` with trailing spaces. Bash silently truncates at `#` so manual `source lab.env` diagnostics looked clean while `make train-mini` used the space-tainted value. This caused `os.path.isdir` to fail on a path that visually appeared correct in all log output (the trailing `\r` or spaces were disguised by terminal rendering).
-
-*Alternatives rejected:* Using `$(strip ...)` in the Makefile — fragile, doesn't address the root cause for future edits.
+**Reason:** The Makefile's `-include lab.env` parses the file as GNU Make syntax. Make preserves whitespace before `#` in assignments, so `VAR=value   # comment` sets Make's variable to `value   `. This is invisible to `source lab.env` + bash inspection. All comments must be on their own line.
 
 ### 4. Re-expose `safety_cost` in info after popping
+*(carried forward)*
 
-**Decision:** `PRISMEnv.step()` pops `"safety_cost"` from info to consume it internally, then immediately re-adds it so the trainer can read it.
+**Decision:** `PRISMEnv.step()` pops `"safety_cost"` from info internally, then immediately re-adds it so the trainer can accumulate per-step costs.
 
-**Reason:** The pop was originally intended to keep the info dict clean, but the trainer needs per-step `c_t` to accumulate `episode_step_costs` for the discounted CVaR computation. Without re-exposing it, the trainer always got 0.0, the CVaR buffer stayed empty, and lambda never moved. Re-exposing is cleaner than changing the trainer to pull costs from a different source.
+### 5. Lambda control: warmup + cap, eta_lambda unchanged
 
-*Alternatives rejected:* Change `pop` to `get` everywhere — `pop` is still correct for the internal consumption; the re-add makes the intent explicit.
+**Decision:** Three independent levers in config: `lambda_warmup_updates: 500`, `lambda_max: 50.0`, `eta_lambda: 0.01` (unchanged). All are config-driven and independently tunable.
+
+**Reason:** The 35× gap between epsilon (~7) and CVaR (~250) had multiple root causes. Fixing epsilon (Bug A) is the primary fix, but the training loop needs protection while the policy is still random at episode start. Warmup gives the policy 500 updates of style-reward-only learning before the constraint activates. The cap prevents numerical PPO collapse if epsilon is still underestimated after rerunning hyperparams. `eta_lambda` is left at 0.01 until we see the new epsilon values — lowering it is a secondary lever if convergence is still slow.
+
+*Alternatives rejected:*
+- Lower `eta_lambda` only — delays divergence but doesn't address root cause if epsilon is still wrong
+- Constraint relaxation / epsilon scaling — adds a tuning parameter without principled grounding; redundant once the alpha curriculum co-schedules epsilon correctly
+- Entropy bonus (`ent_coef`) — helps exploration but doesn't prevent value function collapse at high lambda
+
+### 6. Stop sign violation: positive-check state machine over point-in-polygon
+
+**Decision:** CARLA Leaderboard 2.0-style state machine tracking minimum approach speed before the crossing event, rather than a point-in-polygon check at the stop line.
+
+**Reason:** Point-in-polygon is unreliable at 10 Hz. At 14 m/s, ego moves 1.4m per step — thin stop line polygons can be skipped entirely. The positive check is robust to frame rate and exact line geometry: it asks "did the ego slow to near-zero before passing the sign?" rather than "did the ego's centre intersect the polygon while moving fast?"
+
+**On approach window (5m):** The approach window is a detection parameter, not a reaction-time parameter. The indicator signal (`_must_stop_ahead`) handles shaping; the violation checker just audits the outcome. A 5m window is just wide enough to catch the ego entering the deceleration zone before the sign but tight enough not to credit a stop for unrelated reasons.
+
+*Alternatives rejected:*
+- Point-in-polygon with 0.5m buffer — still misses fast crossings; fires incorrectly for stopped vehicles abutting the line from a previous step
+- 25m window — too large; credits a stop 25m before the sign as compliance
+
+### 7. Blind spot: directional gate only (converging, not any lane change)
+
+**Decision:** Blind spot indicator fires only when ego is moving *toward* the occupied side (`left_occ and v_lat_ego > lc_thresh` OR `right_occ and v_lat_ego < -lc_thresh`). Moving away from an occupied blind spot does not fire.
+
+**Reason:** Penalizing a correct avoidance maneuver (moving away from an occupied blind spot) produces false gradient signal. The agent is doing the right thing. Directional gating gives a precise cost (converging = bad, diverging = neutral) and is strictly better for learning than the symmetric version.
+
+### 8. Stop sign + red light combined in one indicator channel (`red_light`)
+
+**Decision:** `_must_stop_ahead` checks both red traffic lights and stop signs under a single indicator key `"red_light"` in `hyperparams.json`. Both controls require a full stop; the temporal arrival check is identical for both.
+
+**Reason:** Keeping them separate would require a new `"stop_sign_ahead"` key in `INDICATOR_OUTCOME_MAP`, separate calibration, and separate cap tracking — all for a signal that is functionally identical (arrive-within-horizon → must stop). The outcome weights differ (80 vs 70) but the calibrated indicator weights from fallback lead times are similar enough that one channel serves both.
+
+*Alternative considered:* Separate `"stop_sign_ahead"` indicator channel — more precise but adds complexity; can be split later if ablation studies show it matters.
 
 ---
 
 ## Next Immediate Actions
 
-- [ ] First attempt: lower `eta_lambda` from 0.01 → 0.0001 in `configs/prism_default.yaml`, then `rm -rf runs/mini_test && make train-mini`. Watch update 100–300 for CVaR trend.
-- [ ] If CVaR still flat/rising at update 300 with eta_lambda=0.0001: add `lambda_max=50.0` cap to `CVaRLagrangian` in `prism/morl/cvar_lagrangian.py` and re-run.
-- [ ] In parallel: add a one-off diagnostic log of mean per-step `c_t` per episode to compare against what `compute_hyperparams.py` observed — this tests the epsilon underestimation hypothesis.
+- [ ] **Delete `hyperparams.json` and rerun:** `rm hyperparams.json && make hyperparams-mini` — calibration logic now includes all 5 indicator channels via `SafetyCostBuilder.compute()` rather than inline TTC/THW only. This is the primary fix for the Lagrangian divergence.
+- [ ] **Check epsilon:** `make check-hyperparams` — verify `epsilon@0.95` is substantially higher than the old ~7. Expected range after fix: 50–300+ depending on how often speed/blind_spot fire on expert data. If epsilon is still < 20, investigate indicator_weights in `hyperparams.json` and whether the bootstrap SafetyCostBuilder is firing.
+- [ ] **Rerun training:** `rm -rf runs/mini_test && make train-mini` — watch update 500 (end of warmup). Lambda should be 0.0 at update 500 and CVaR should be non-trivially changing. After update 500, lambda should grow slowly and either plateau (constraint satisfied) or grow to `lambda_max=50.0` (constraint violated but capped).
+- [ ] **Validate stop sign state machine:** in a short diagnostic run, confirm `safety_components.stop_sign` fires at least occasionally (nuPlan mini has stop signs). If zero fires across a full episode run, check `map_cache.stop_lines` is populated in the live env (it may not be if CaRL builds the cache without `load_stop_lines=True`).
+- [ ] **Push to GitHub** once training shows convergent lambda behavior on mini.
 - [ ] After Lagrangian convergence is confirmed on mini: scale up to `make train` (K=5, full dataset).
 
 ---
@@ -115,14 +200,14 @@ Fixed a silent bug where the safety constraint was never active:
 
 ### phi = 0.42 rad/s (above expected range of 0.01–0.3)
 
-**Question:** The lateral heading-rate scale parameter phi is 0.42 after Savitzky-Golay smoothing. The check script warns (not FAILs) at this value. Is this a calibration artifact of the mini dataset, or is 0.42 genuinely representative?
+**Question:** The lateral heading-rate scale parameter phi is 0.42 after Savitzky-Golay smoothing. Is this a calibration artifact of the mini dataset, or is 0.42 genuinely representative?
 
-**Status:** Confirmed value after smoothing. Deferred — the rest of the pipeline is now running, so this is a lower priority. phi=0.42 means sharp-turn heading rates (common in urban intersection scenarios in the mini split) sit at the 1-sigma point of `r_heading`, compressing the reward less than a calibrated value would. Training will still work; style discrimination for lateral discipline may be slightly reduced.
+**Status:** Confirmed value after smoothing. Deferred — the rest of the pipeline is now running. phi=0.42 means sharp-turn heading rates (common in urban intersection scenarios in the mini split) sit at the 1-sigma point of `r_heading`, compressing the reward less than a calibrated value would. Training will still work; style discrimination for lateral discipline may be slightly reduced.
 
 **Approaches:**
-- (a) Widen the check-script upper bound to 0.5 and document the urban mini dataset bias — quick fix, allows `make check-hyperparams` to fully pass
-- (b) Increase SG filter window (e.g., window=11 or 15) for heading — may reduce phi further at the cost of over-smoothing genuine heading changes
-- (c) Use full training split (not mini) for hyperparams computation — more diverse scenarios should bring phi into range, but requires full cache first
+- (a) Widen the check-script upper bound to 0.5 and document the urban mini dataset bias — quick fix
+- (b) Increase SG filter window (e.g., 11 or 15) for heading — may reduce phi further at cost of over-smoothing genuine heading changes
+- (c) Use full training split for hyperparams computation — more diverse scenarios should bring phi into range, but requires full cache first
 
 **Recommendation:** Option (a) as an immediate fix; revisit with option (c) before the final training run for the paper.
 
@@ -130,7 +215,7 @@ Fixed a silent bug where the safety constraint was never active:
 
 **Question:** Is this a calibration artifact of the mini dataset's smooth scenarios, or a genuine measurement?
 
-**Status:** Unchanged from previous session. WARN, not FAIL. ZtNormaliser EMA (beta=0.01) adapts during training, so this is not blocking.
+**Status:** Unchanged. WARN, not FAIL. ZtNormaliser EMA (beta=0.01) adapts during training.
 
 **Approaches:**
 - (a) Accept — self-corrects during training
@@ -141,48 +226,23 @@ Fixed a silent bug where the safety constraint was never active:
 
 **Question:** z_mu for progress (≈28) is far below comfort/lateral/spacing (≈290–400).
 
-**Status:** Root cause known: `_EmptyMapProxy` forces v_des = 13.89 m/s (50 km/h) for all steps; urban mini scenarios have v_ego << v_des, collapsing r_speed ≈ 0. ZtNormaliser EMA will self-correct within a few hundred training episodes.
+**Status:** Root cause known: `_EmptyMapProxy` forces v_des = 13.89 m/s for all calibration steps; urban mini scenarios have v_ego << v_des, collapsing r_speed ≈ 0. Now partially improved because Bug 6 (discounted z_t) is fixed — the undiscounted sum was also inflating the other three dimensions relative to progress. ZtNormaliser EMA will self-correct within a few hundred training episodes.
 
-**Recommendation:** Accept for now. Note in paper appendix that z_t normalisation bootstraps from 50 km/h default and adapts online.
+**Recommendation:** Accept for now. Note in paper appendix.
 
-### Lagrangian divergence during train-mini — BLOCKING
+### Lagrangian divergence — partially addressed, not yet retested
 
-**Question:** CVaR is stuck at 200–300 and lambda is growing linearly without bound. The safety constraint is not converging. What is causing this and how do we fix it?
+**Question:** Will the Lagrangian converge after the epsilon calibration fix, lambda warmup, and lambda cap?
 
-**Status:** Confirmed divergence at update 500. Lambda reached 1182 growing ~24/10 updates (~2.4/update). CVaR did not fall — it fluctuated 191–298 with no downward trend, actually increasing slightly after update 200. The policy is not learning to reduce safety violations despite the constraint penalty growing to dominate the reward.
+**Status:** Previous run: lambda reached 1182 at update 500 with CVaR stuck at 200–300 and epsilon ~7 (35× gap). Root causes addressed this session:
+- Bug A fix: epsilon should now reflect all 5 indicator channels in expert data — expected to be much higher
+- Lambda warmup (500 updates): policy learns basic driving before constraint activates
+- Lambda cap (50.0): prevents numerical PPO collapse if epsilon is still underestimated
 
-**Observed data (selected):**
-
-| update | CVaR | lambda |
-|--------|------|--------|
-| 40 | 222.5 | 112 |
-| 100 | 221.1 | 230 |
-| 200 | 199.7 | 436 |
-| 300 | 256.7 | 673 |
-| 400 | 270.4 | 935 |
-| 500 | 242.6 | 1182 |
-
-**Root cause analysis:**
-
-The gap between epsilon (~7) and CVaR (~250) is ~35×. The math: with ~150-step episodes and gamma=0.99, a constant per-step c_t of ~3.2 produces a discounted episode cost of ~250. Epsilon=6.987 was calibrated from expert rollouts where safety violations were rare. A random untrained policy violates safety every step. The Lagrangian is designed for policies near the constraint boundary, not 35× over it. Lambda grows linearly as `eta_lambda * (CVaR - epsilon) ≈ 0.01 * 245 ≈ 2.45/update`, reaching 24,500 by update 10,000 with no mechanism to stop it.
-
-Additionally, at lambda=1182 with c_t≈3.2/step, the Lagrangian penalty dominates effective_reward by ~3800× relative to the DPMORL scalar R_t (which is sub-1.0 scale). PPO is receiving a nearly pure safety signal with negligible style gradient — yet CVaR is not falling. This suggests the PPO update is not successfully propagating the safety penalty into better behavior, possibly because the gradient magnitude is so large it destabilizes learning.
-
-**Suspected secondary cause — epsilon underestimated:** During `compute_hyperparams.py`, safety costs were computed using `_EmptyMapProxy` (no map data) and `_DetectionProxy` (expert tracked objects). In the live training environment, CaRL's `EnvironmentWrapper` provides real map and detection data, potentially generating higher indicator costs (TTC, THW) every step than were present in the expert calibration. This would make epsilon systematically too low for the training distribution.
-
-**Approaches (ranked by recommendation):**
-
-- **(a) Lower `eta_lambda` drastically** — change from 0.01 → 0.0001 in `configs/prism_default.yaml`. This slows lambda growth by 100×, giving the policy time to learn before the penalty becomes numerically overwhelming. Tradeoff: safety constraint activates much more slowly; may need more total training updates.
-
-- **(b) Clip lambda to a maximum value** — add `lambda_max` parameter (e.g., 10.0 or 50.0) to `CVaRLagrangian` and `cvar_lagrangian.py`. This prevents divergence while still applying the constraint. Tradeoff: a hard cap is not theoretically principled for a Lagrangian; the cap value requires tuning.
-
-- **(c) Warm-start with lambda=0** — train for N_warmup updates (e.g., 500–1000) with `lambda_k` held at 0, then reset lambda to 0 and begin the curriculum. This lets the policy learn basic driving before the constraint is introduced. The `--phase` flag already exists in `train.py` for phase A/B separation; could extend this. Tradeoff: adds a training phase, requires implementation.
-
-- **(d) Investigate epsilon underestimation** — log per-step c_t means during a training rollout and compare to what `compute_hyperparams.py` saw. If training c_t is systematically higher than calibration c_t (due to real vs. proxy map/detection data), re-calibrate epsilon by running `collect_expert_rollouts` with real CaRL env data (requires cache to exist first). Tradeoff: complex; requires rebuilding hyperparams after cache is built.
-
-- **(e) Scale down safety cost weights** — divide all `OUTCOME_WEIGHTS` in `safety_cost.py` by a constant (e.g., 10) to bring episode costs to ~25 instead of ~250, closer to epsilon. Tradeoff: changes the meaning of the safety cost signal and invalidates the current hyperparams.json; requires rerunning `compute_hyperparams.py`.
-
-**Recommendation:** Try (a) first — one-line config change, no code changes, fast to iterate. If CVaR still doesn't fall by update 500 with eta_lambda=0.0001, move to (b) combined with (a) to cap lambda at 10–50 while learning proceeds. Investigate (d) in parallel to understand if epsilon is the root mismatch.
+**What to watch in the next run:**
+- Update 500 (end of warmup): lambda should be 0.0, CVaR should be within ~2-3× of new epsilon
+- Updates 500–1500: lambda should grow slowly and stabilise or plateau at 50.0
+- If lambda still diverges to cap immediately: epsilon is still too low — investigate `indicator_weights` in `hyperparams.json` or whether indicators are firing on expert data
 
 ---
 
@@ -192,40 +252,49 @@ Additionally, at lambda=1182 with c_t≈3.2/step, the Lagrangian penalty dominat
 GNU Make's `-include lab.env` preserves trailing whitespace before `#` in assignments. `export VAR=value   # comment` → Make sets VAR to `value   `. This is invisible to `source lab.env` + bash inspection, and the trailing spaces survive into Python's `os.environ`, causing `os.path.isdir` failures. All comments must be on their own line above the assignment.
 
 ### CaRL reads `NUPLAN_MAPS_ROOT` (with S), not `NUPLAN_MAP_ROOT`
-`carl_nuplan/planning/gym/cache/gym_scenario.py` line 21: `NUPLAN_MAPS_ROOT = os.getenv("NUPLAN_MAPS_ROOT")`. This is evaluated at module import time. If unset, every scenario load raises `TypeError: stat: path should be string … not NoneType`.
+`carl_nuplan/planning/gym/cache/gym_scenario.py` line 21: `NUPLAN_MAPS_ROOT = os.getenv("NUPLAN_MAPS_ROOT")`. Evaluated at module import time. If unset, every scenario load raises `TypeError: stat: path should be string … not NoneType`.
 
 ### System libstdc++ on lab machine lacks CXXABI_1.3.15
-Conda's ICU library (`libicui18n.so.78`), pulled in by conda's sqlite3, requires `CXXABI_1.3.15`. The lab machine's system `/lib/x86_64-linux-gnu/libstdc++.so.6` only has up to CXXABI_1.3.14. Fix: `LD_PRELOAD` the conda env's `libstdc++.so.6` in `lab.env`. Previously, `opencv-python<5.0` was pinned in `environment.yml` for the same underlying reason (5.x also requires CXXABI_1.3.15).
+Conda's ICU library requires `CXXABI_1.3.15`. Fix: `LD_PRELOAD` the conda env's `libstdc++.so.6` in `lab.env`.
 
 ### `gym==0.26.2` required (legacy gym, not gymnasium)
-CaRL's `ppo_model.py` does `import gym` — the old OpenAI gym, not the `gymnasium` fork. Must be pinned to `gym==0.26.2` (last stable release before the fork). Now in `environment.yml`. Not caught by `make check` because the import only triggers when `_build_agent()` runs inside `train.py`, not at module load time.
+CaRL's `ppo_model.py` does `import gym`. Must be pinned to `gym==0.26.2`. Not caught by `make check` because the import only triggers when `_build_agent()` runs inside `train.py`.
 
 ### `safety_cost` is popped from info in PRISMEnv.step()
-`PRISMEnv.step()` (`prism/env/nuplan_env.py:442`) pops `"safety_cost"` from the info dict, then re-adds it. The trainer reads `info.get("safety_cost", 0.0)` per step to accumulate episode costs for CVaR. If the re-add is ever removed, the CVaR buffer silently fills with zeros and lambda never moves — no error is raised.
+`PRISMEnv.step()` pops `"safety_cost"` from the info dict, then re-adds it. If the re-add is ever removed, the CVaR buffer silently fills with zeros and lambda never moves — no error is raised.
 
 ### Lagrangian state is in a separate `.json`, not the `.pth` checkpoint
-`policy_{k}_model_{tag}.pth` contains only the agent weights. `policy_{k}_lagrangian_{tag}.json` contains the CVaR buffer (`costs` key) and lambda history. To inspect the cost buffer: `cat policy_0_lagrangian_000000499.json | python -c "import json,sys; d=json.load(sys.stdin); print(d['costs'][:10])"`.
+`policy_{k}_model_{tag}.pth` contains only agent weights. `policy_{k}_lagrangian_{tag}.json` contains the CVaR buffer (`costs` key) and lambda. To inspect: `cat policy_0_lagrangian_000000499.json | python -c "import json,sys; d=json.load(sys.stdin); print(d['costs'][:10])"`.
 
 ### Train-mini logs only every 100 updates
-`dpmorl_trainer.py:218`: `if (update + 1) % 100 == 0`. With 512 steps/update and slow nuPlan stepping, the first log line appears after many minutes. No output ≠ hung. Verify with `nvidia-smi` or `top -p $(pgrep -f train.py)`.
+`dpmorl_trainer.py`: `if (update + 1) % 100 == 0`. No output ≠ hung. Verify with `nvidia-smi` or `top -p $(pgrep -f train.py)`.
 
 ### nuPlan map utils RuntimeWarning: invalid value encountered in cast
-`nuplan/common/maps/nuplan_map/utils.py:413` — NaN→int cast on optional map attributes in the mini dataset. Fires intermittently during cache build and scenario loading. Gracefully degrades (drops bad map elements). Safe to ignore; not a PRISM bug.
+`nuplan/common/maps/nuplan_map/utils.py:413` — NaN→int cast on optional map attributes in the mini dataset. Gracefully degrades. Safe to ignore.
 
 ### NuPlanScenarioBuilder requires `sensor_root`
-Constructor requires `sensor_root` as a positional/keyword arg even if sensors are unused. Pass `sensor_root=nuplan_data_root` as a dummy.
+Pass `sensor_root=nuplan_data_root` as a dummy even if sensors are unused.
 
 ### ScenarioFilter kwargs must exactly match build_cache.py
-See `scripts/build_cache.py` lines 95–110 for the working call signature. Extra or missing kwargs cause TypeError.
+See `scripts/build_cache.py` lines 95–110 for the working call signature.
 
 ### angular_velocity not stored in nuPlan mini DB
 `DynamicCarState.angular_velocity` returns 0.0 for all ego states. Detect with `np.max(np.abs(ang_vel)) < 1e-5`; fall back to finite-differenced heading with Savitzky-Golay smoothing.
 
 ### epsilon_curve is monotone INCREASING (not decreasing)
-CVaR_alpha increases with alpha. The check script verifies increasing order. This was previously backwards and caused a false FAIL.
+CVaR_alpha increases with alpha. The check script verifies increasing order.
 
 ### compute_hyperparams and build_cache are independent
 Neither is a prerequisite for the other. Both feed into `train.py` and can run in parallel or in either order.
+
+### `map_cache.stop_lines` may not be populated in the live CaRL env
+CaRL's `environment_cache_manager` may not load stop lines unless the cache was built with `load_stop_lines=True`. If `getattr(map_cache, "stop_lines", {})` returns an empty dict in training, the stop sign violation checker and must_stop_ahead indicator will silently return False for stop signs. The TTC/THW/speed/blind_spot indicators are unaffected. Verify by logging `len(map_cache.stop_lines)` in one episode; if zero throughout, add `load_stop_lines=True` to the environment cache builder call.
+
+### SafetyCostBuilder.compute() signature changed
+`had_stop_sign_violation` parameter removed. Any caller (including test code) using the old signature will break with an unexpected keyword argument. Stop sign detection is now fully internal.
+
+### `SafetyCostComponents.red_light_ahead_active` renamed to `must_stop_ahead_active`
+Any code that previously logged or tested `comp.red_light_ahead_active` will need updating.
 
 ---
 
@@ -234,5 +303,6 @@ Neither is a prerequisite for the other. Both feed into `train.py` and can run i
 - nuplan-devkit 1.2.2: https://github.com/motional/nuplan-devkit
 - CaRL (installed at `../nuPlan/`): https://github.com/autonomousvision/CaRL
 - DPMORL (NeurIPS 2023): https://github.com/zpschang/DPMORL
+- CARLA RunStopSign (Leaderboard 2.0 pattern): `CARLA/team_code/reward/criteria/run_stop_sign.py`
 - Paper draft: `docs/prism_paper_v2.tex`
 - Lab machine paths: `lab.env` (gitignored)

@@ -44,9 +44,11 @@ class CVaRLagrangian:
         eta_lambda: float = 0.01,
         buffer_size: int = 500,
         lambda_init: float = 0.0,
+        lambda_max: float = float("inf"),
     ) -> None:
         self._eta = eta_lambda
         self._lambda: float = max(0.0, lambda_init)
+        self._lambda_max: float = float(lambda_max)
         self._costs: Deque[float] = deque(maxlen=buffer_size)
 
     # ------------------------------------------------------------------
@@ -90,7 +92,10 @@ class CVaRLagrangian:
         """
         cvar_hat = self.estimate_cvar(alpha)
         constraint_violation = cvar_hat - epsilon
-        self._lambda = max(0.0, self._lambda + self._eta * constraint_violation)
+        self._lambda = min(
+            self._lambda_max,
+            max(0.0, self._lambda + self._eta * constraint_violation),
+        )
         return self._lambda, cvar_hat
 
     # ------------------------------------------------------------------
@@ -112,13 +117,18 @@ class CVaRLagrangian:
     def state_dict(self) -> dict:
         return {
             "lambda": self._lambda,
+            "lambda_max": self._lambda_max,
             "costs": list(self._costs),
             "eta_lambda": self._eta,
         }
 
     @classmethod
     def from_state_dict(cls, d: dict) -> "CVaRLagrangian":
-        obj = cls(eta_lambda=d["eta_lambda"], lambda_init=d["lambda"])
+        obj = cls(
+            eta_lambda=d["eta_lambda"],
+            lambda_init=d["lambda"],
+            lambda_max=d.get("lambda_max", float("inf")),
+        )
         obj._costs.extend(d.get("costs", []))
         return obj
 

@@ -191,35 +191,78 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
         delta_psi = np.abs(ang_vel)
     d_lat = np.zeros(n_iter)  # expert data stays in-lane; use 0 as default
 
-    # ── 3. Per-step regime + lead-vehicle detection ───────────────────────────
+    # ── 3. Per-step regime + safety cost (combined pass) ─────────────────────
+    # All five indicator channels (TTC, THW, speed, blind spot, red light ahead)
+    # are evaluated via SafetyCostBuilder so calibration uses the same cost
+    # signal as training.  Expert trajectories never trigger outcome events, so
+    # all outcome flags are passed as False.
+    safety_builder = SafetyCostBuilder(bootstrap_hp)
+    safety_builder.reset()
+
+    map_proxy = _EmptyMapProxy()
     v_des_arr = np.full(n_iter, regime_detector.DEFAULT_SPEED_LIMIT_MPS)
     d_lead_arr = np.full(n_iter, np.inf)
     v_lead_arr = np.zeros(n_iter)
     has_lead_arr = np.zeros(n_iter, dtype=bool)
-
-    map_proxy = _EmptyMapProxy()
+    ttc_arr = np.full(n_iter, np.inf)
+    safety_costs = np.zeros(n_iter)
+    indicator_events: Dict[str, List[int]] = {k: [] for k in INDICATOR_OUTCOME_MAP}
+    outcome_events: Dict[str, List[int]]   = {k: [] for k in OUTCOME_WEIGHTS}
 
     for i, es in enumerate(ego_states):
+        det_proxy = _DetectionProxy(None)
+        v_limit_i = regime_detector.DEFAULT_SPEED_LIMIT_MPS
         try:
             tracked_raw = scenario.get_tracked_objects_at_iteration(i)
             det_proxy = _DetectionProxy(tracked_raw)
             result = regime_detector.detect(es, map_proxy, det_proxy)
-            v_des_arr[i]   = result.v_des
-            d_lead_arr[i]  = result.d_lead
-            v_lead_arr[i]  = result.v_lead
+            v_des_arr[i]    = result.v_des
+            d_lead_arr[i]   = result.d_lead
+            v_lead_arr[i]   = result.v_lead
             has_lead_arr[i] = result.has_lead
+            v_limit_i       = result.v_limit
         except Exception:
             pass
 
-    # ── 4. TTC per step ───────────────────────────────────────────────────────
-    ttc_arr = np.full(n_iter, np.inf)
-    for i in range(n_iter):
-        if has_lead_arr[i]:
-            closing = v_ego[i] - v_lead_arr[i]
-            if closing > 1e-3:
-                ttc_arr[i] = d_lead_arr[i] / closing
+        # TTC for logging
+        if has_lead_arr[i] and (v_ego[i] - v_lead_arr[i]) > 1e-3:
+            ttc_arr[i] = d_lead_arr[i] / (v_ego[i] - v_lead_arr[i])
 
-    # ── 5. Style rewards using bootstrap scaling params ───────────────────────
+        # Full safety cost — all outcome flags False for expert data
+        try:
+            comp = safety_builder.compute(
+                ego_state=es,
+                detection_cache=det_proxy,
+                map_cache=map_proxy,
+                had_vru_collision=False,
+                had_vehicle_collision=False,
+                had_object_collision=False,
+                is_off_road=False,
+                ran_red_light=False,
+                had_wrong_direction=False,
+                v_lead=float(v_lead_arr[i]),
+                d_lead=float(d_lead_arr[i]) if np.isfinite(d_lead_arr[i]) else 1000.0,
+                has_lead=bool(has_lead_arr[i]),
+                v_limit=v_limit_i,
+                v_lat_ego=float(v_lat_raw[i]),
+            )
+            safety_costs[i] = comp.total
+            if comp.ttc_active:
+                indicator_events["ttc"].append(i)
+            if comp.thw_active:
+                indicator_events["thw"].append(i)
+            if comp.speed_active:
+                indicator_events["speed"].append(i)
+            if comp.blind_spot_active:
+                indicator_events["blind_spot"].append(i)
+        except Exception:
+            pass
+
+    # Discounted cumulative cost
+    gamma_pow = gamma ** np.arange(n_iter)
+    cum_cost = float((gamma_pow * safety_costs).sum())
+
+    # ── 4. Style rewards using bootstrap scaling params ───────────────────────
     style_r = np.zeros((n_iter, 4), dtype=np.float32)
     for i in range(n_iter):
         try:
@@ -240,44 +283,6 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
             )
         except Exception:
             style_r[i] = np.array([1.0, 0.5, 1.0, 1.0], dtype=np.float32)
-
-    # ── 6. Safety cost + indicator/outcome events ─────────────────────────────
-    # Expert trajectories rarely trigger outcome events.  We record indicator
-    # firings (TTC, THW) and assign bootstrap per-step costs derived from
-    # physics-based fallback lead times and outcome weights.  These are used
-    # only to produce a non-zero epsilon_curve; the actual calibrated weights
-    # are computed afterward by derive_indicator_weights().
-    #
-    # Bootstrap indicator weights from fallback lead times (physics-based):
-    #   w_ttc  = mean(W_i / T_{ttc->i}) ≈ mean(80/15, 80/15, 40/15) ≈ 4.9
-    #   w_thw  = mean(W_i / T_{thw->i}) ≈ mean(80/20, 80/20, 40/20) ≈ 3.7
-    # These match the calibrated indicator_weights in the output, so the
-    # epsilon_curve represents a realistic "safe driver" cost distribution.
-    _W_TTC = sum(OUTCOME_WEIGHTS[o] / _fallback_lead_time("ttc", o)
-                 for o in INDICATOR_OUTCOME_MAP["ttc"]) / len(INDICATOR_OUTCOME_MAP["ttc"])
-    _W_THW = sum(OUTCOME_WEIGHTS[o] / _fallback_lead_time("thw", o)
-                 for o in INDICATOR_OUTCOME_MAP["thw"]) / len(INDICATOR_OUTCOME_MAP["thw"])
-
-    ttc_thresh = bootstrap_hp["safety_thresholds"]["ttc_threshold_s"]
-    thw_thresh = bootstrap_hp["safety_thresholds"]["thw_threshold_s"]
-
-    safety_costs = np.zeros(n_iter)
-    indicator_events: Dict[str, List[int]] = {k: [] for k in INDICATOR_OUTCOME_MAP}
-    outcome_events: Dict[str, List[int]]   = {k: [] for k in OUTCOME_WEIGHTS}
-
-    for i in range(n_iter):
-        ttc_val = ttc_arr[i]
-        if np.isfinite(ttc_val) and ttc_val < ttc_thresh:
-            indicator_events["ttc"].append(i)
-            safety_costs[i] += _W_TTC
-
-        if has_lead_arr[i] and v_ego[i] > 1e-3:
-            thw_val = d_lead_arr[i] / v_ego[i]
-            if thw_val < thw_thresh:
-                indicator_events["thw"].append(i)
-                safety_costs[i] += _W_THW
-
-    cum_cost = float(sum(_GAMMA_DEFAULT ** t * safety_costs[t] for t in range(n_iter)))
 
     return {
         "j_lon":             j_lon,
@@ -402,6 +407,18 @@ def collect_expert_rollouts(n_rollouts: int,
     from prism.env.regime_detector import RegimeDetector
 
     # Bootstrap scaling params (calibrated values derived from the data collected here)
+    # Bootstrap indicator weights from fallback lead times (used by SafetyCostBuilder
+    # during calibration so all 5 indicator channels contribute to the epsilon curve)
+    _bs_ind_weights: Dict[str, float] = {}
+    _bs_ind_caps: Dict[str, float] = {}
+    for _ind, _outs in INDICATOR_OUTCOME_MAP.items():
+        _n = len(_outs)
+        _bs_ind_weights[_ind] = float(sum(
+            OUTCOME_WEIGHTS[_o] / (_n * _fallback_lead_time(_ind, _o))
+            for _o in _outs
+        ))
+        _bs_ind_caps[_ind] = float(np.mean([OUTCOME_WEIGHTS[_o] for _o in _outs]))
+
     bootstrap_hp: Dict = {
         "reward_scaling": {
             "sigma_j_sq": 1.0,
@@ -412,10 +429,15 @@ def collect_expert_rollouts(n_rollouts: int,
             "sigma_d":    0.2,
         },
         "floor_values":       {"delta_d": 0.3, "delta_s": 0.2},
-        "indicator_weights":  {},
-        "indicator_caps":     {},
+        "indicator_weights":  _bs_ind_weights,
+        "indicator_caps":     _bs_ind_caps,
         "outcome_weights":    OUTCOME_WEIGHTS,
-        "safety_thresholds":  {"ttc_threshold_s": 1.5, "thw_threshold_s": 2.0},
+        "safety_thresholds":  {
+            "ttc_threshold_s":  1.5,
+            "thw_threshold_s":  2.0,
+            "lane_change_lateral_vel_threshold_ms": 0.3,
+            "red_light_arrival_horizon_s": 4.0,
+        },
     }
 
     map_root = _locate_map_root(nuplan_data_root)
@@ -499,14 +521,14 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     tau        : set so mean(TTC) when TTC < 10s -> reward ~0.63
                  i.e. tau = mean(TTC[TTC < 10])
     """
-    all_jerk_sq   = np.concatenate([ep["j_lon"]**2 + ep["j_lat"]**2
-                                     for ep in episodes])
+    all_jerk_magnitude   = np.sqrt(np.concatenate([ep["j_lon"]**2 + ep["j_lat"]**2
+                                     for ep in episodes]))
     all_a_ego     = np.concatenate([np.abs(ep["a_ego"]) for ep in episodes])
     all_delta_psi = np.concatenate([np.abs(ep["delta_psi"]) for ep in episodes])
     all_ttc       = np.concatenate([ep["ttc"][ep["ttc"] < 10]
                                      for ep in episodes])
 
-    sigma_j_sq = float(np.var(all_jerk_sq))
+    sigma_j_sq = float(np.var(all_jerk_magnitude))
     # Avoid division by zero
     sigma_j_sq = max(sigma_j_sq, 1e-6)
 
@@ -607,17 +629,25 @@ def _fallback_lead_time(indicator: str, outcome: str) -> float:
     return float(fallbacks.get((indicator, outcome), 30))
 
 
-def compute_zt_normalisation(episodes: List[Dict]) -> Dict:
+def compute_zt_normalisation(episodes: List[Dict], gamma: float = 0.99) -> Dict:
     """
-    Compute mean and std of cumulative style return z_T for each
-    of the 4 objectives, from expert warm-up rollouts.
-    Used to initialise z_t normalisation before training.
+    Compute mean and std of the discounted cumulative style return z_T for each
+    of the 4 objectives:  z_T = sum_t( gamma^t * r_t )
+
+    Must match the z_t accumulation in PRISMEnv.step():
+        z_{t+1} = z_t + gamma^t * r_t
+
+    The undiscounted sum would underestimate the contribution of early timesteps
+    and produce normalisation statistics inconsistent with training.
     """
-    z_finals = np.array([ep["style_r"].sum(axis=0) for ep in episodes])
-    # z_finals shape: (N_rollouts, 4)
+    z_finals = []
+    for ep in episodes:
+        r = ep["style_r"]                        # shape (T, 4)
+        gammas = gamma ** np.arange(len(r))      # shape (T,)
+        z_finals.append((gammas[:, None] * r).sum(axis=0))
+    z_finals = np.array(z_finals)                # shape (N, 4)
     z_mu    = z_finals.mean(axis=0).tolist()
     z_sigma = z_finals.std(axis=0).tolist()
-    # Avoid zero std
     z_sigma = [max(s, 1e-6) for s in z_sigma]
     return {"z_mu": z_mu, "z_sigma": z_sigma}
 
@@ -700,7 +730,7 @@ def main():
     ind_params = derive_indicator_weights(lead_times)
 
     print("[compute_hyperparams] Computing z_t normalisation statistics...")
-    z_norm = compute_zt_normalisation(episodes)
+    z_norm = compute_zt_normalisation(episodes, gamma=args.gamma)
 
     # ── Assemble and save ─────────────────────────────────────────────────────
     hyperparams = {
@@ -732,6 +762,7 @@ def main():
             "ttc_threshold_s":        1.5,
             "thw_threshold_s":        2.0,
             "lane_change_lateral_vel_threshold_ms": 0.3,
+            "red_light_arrival_horizon_s": 4.0,
         },
     }
 
