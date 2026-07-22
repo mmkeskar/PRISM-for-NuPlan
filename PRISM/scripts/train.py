@@ -190,7 +190,7 @@ def _build_env(cfg: dict, hp: dict, utility_fn, lambda_k: float, zt_normaliser):
         lambda_k=lambda_k,
         gamma=cfg.get("gamma", 0.99),
         zt_normaliser=zt_normaliser,
-        terminate_on_failure=False,
+        terminate_on_failure=cfg.get("terminate_on_failure", True),
     )
 
     # Inject env back-reference so the camera builder can resolve the log file path

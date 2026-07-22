@@ -27,6 +27,15 @@ Usage
         --policy random \\
         --n_episodes 3
 
+    # Watch a trained checkpoint instead of a scripted policy
+    # (uses the same checkpoint loading as scripts/evaluate.py):
+    python scripts/explore_simulator.py \\
+        --mode cache \\
+        --cache_path $NUPLAN_EXP_ROOT/mini_cache \\
+        --checkpoint_dir runs/mini_test \\
+        --policy_k 0 \\
+        --n_episodes 3
+
 Outputs
 -------
   explore_output/episode_NNN.avi         — BEV video (semantic raster)
@@ -325,6 +334,15 @@ def main():
     parser.add_argument("--hyperparams", type=str, default="hyperparams.json")
     parser.add_argument("--config", type=str, default="configs/prism_default.yaml")
     parser.add_argument("--policy", choices=list(POLICIES), default="random")
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="Path to a runs/... directory with trained checkpoints "
+                             "(policy_{k}_model_*.pth). If set, overrides --policy and "
+                             "drives the episode with the trained agent instead.")
+    parser.add_argument("--policy_k", type=int, default=0,
+                        help="Which policy index k to load from --checkpoint_dir.")
+    parser.add_argument("--stochastic", action="store_true",
+                        help="Sample actions instead of taking the deterministic mean "
+                             "(only applies with --checkpoint_dir).")
     parser.add_argument("--n_episodes", type=int, default=3)
     parser.add_argument("--max_steps", type=int, default=150)
     parser.add_argument("--agent_type", choices=["tracks", "idm_agents", "no_tracks"],
@@ -346,12 +364,13 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    gamma = 0.99
+    cfg = {}
     try:
         with open(args.config) as f:
-            gamma = yaml.safe_load(f).get("gamma", 0.99)
+            cfg = yaml.safe_load(f) or {}
     except Exception:
         pass
+    gamma = cfg.get("gamma", 0.99)
 
     hp_path = Path(args.hyperparams)
     if hp_path.exists():
@@ -391,6 +410,21 @@ def main():
     policy_fn = POLICIES[args.policy]
     action_space = env.action_space
 
+    # ── Trained-checkpoint agent (overrides --policy if given) ───────────────
+    agent = None
+    device = None
+    if args.checkpoint_dir:
+        import torch
+        from scripts.evaluate import _load_policy
+
+        device = torch.device(cfg.get("device", "cuda:0")) \
+            if cfg.get("cuda") and torch.cuda.is_available() else torch.device("cpu")
+        agent, _ = _load_policy(Path(args.checkpoint_dir), args.policy_k, cfg, device)
+        logger.info(
+            f"Driving episodes with trained checkpoint "
+            f"(policy_k={args.policy_k}, dir={args.checkpoint_dir}) — ignoring --policy={args.policy}"
+        )
+
     # ── Episode loop ──────────────────────────────────────────────────────────
     for ep in range(args.n_episodes):
         logger.info(f"\n{'─'*55}")
@@ -404,9 +438,24 @@ def main():
         zt_history = [np.zeros(4)]
         rvec_history = []
         cost_history = []
+        lstm_state = None
 
         while not done and step < args.max_steps:
-            action = policy_fn(obs, action_space)
+            if agent is not None:
+                obs_t = {
+                    kk: torch.from_numpy(np.array(vv)).unsqueeze(0).to(device)
+                    for kk, vv in obs.items()
+                }
+                with torch.no_grad():
+                    action_t, *_rest, lstm_state = agent.forward(
+                        obs_t,
+                        deterministic=not args.stochastic,
+                        lstm_state=lstm_state,
+                        done=torch.zeros(1, device=device),
+                    )
+                action = action_t.squeeze(0).cpu().numpy()
+            else:
+                action = policy_fn(obs, action_space)
             next_obs, reward, term, trunc, info = env.step(action)
             done = term or trunc
 

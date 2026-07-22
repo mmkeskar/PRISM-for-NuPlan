@@ -85,6 +85,11 @@ scenario_types: null             # null = all types
 log_splits:
   - train
 
+# Terminate episode on collision / off-road (True = standard closed-loop safe-RL
+# behaviour; keeps training-time safety cost comparable to the expert-log
+# calibration, which never contains these events).
+terminate_on_failure: true
+
 # ── Hardware ─────────────────────────────────────────────────────────────────
 cuda: true
 device: cuda:0                  # device for policy and utility function

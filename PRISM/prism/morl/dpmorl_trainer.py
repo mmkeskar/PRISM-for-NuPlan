@@ -146,6 +146,8 @@ class DPMORLTrainer:
             "policy_id": self.policy_id,
             "lambda_history": [],
             "cvar_history": [],
+            "mu_c": [],
+            "sigma_c": [],
             "episode_zts": [],
         }
 
@@ -153,12 +155,18 @@ class DPMORLTrainer:
         next_obs = {k: torch.from_numpy(np.array(v)).unsqueeze(0).to(self.device)
                     for k, v in obs.items()}
 
+        # Accumulates step costs for the episode currently in progress. Lives
+        # outside the update loop because an episode (up to max_episode_steps)
+        # can span a PPO update boundary (steps_per_update) — resetting this
+        # per-update would silently drop the pre-boundary portion of that
+        # episode's cost when it finishes early in the next update.
+        episode_step_costs: List[float] = []
+
         for update in range(n_updates):
             alpha, epsilon = self.alpha_schedule.get(update)
 
             # ── Rollout collection ─────────────────────────────────────
             self._buffer.clear()
-            episode_step_costs: List[float] = []
 
             for _ in range(steps_per_update):
                 self._global_step += 1
@@ -221,14 +229,21 @@ class DPMORLTrainer:
                 summary["lambda_history"].append(new_lambda)
                 summary["cvar_history"].append(cvar_hat)
 
+            mu_c, sigma_c = self.lagrangian.cost_stats()
+            summary["mu_c"].append(mu_c)
+            summary["sigma_c"].append(sigma_c)
+
             if (update + 1) % 100 == 0:
                 _lam = summary["lambda_history"][-1] if summary["lambda_history"] else 0.0
                 _cvar = summary["cvar_history"][-1] if summary["cvar_history"] else 0.0
+                _mu_c = summary["mu_c"][-1] if summary["mu_c"] else 0.0
+                _sigma_c = summary["sigma_c"][-1] if summary["sigma_c"] else 0.0
                 _warmup_tag = " [warmup]" if update < self._lambda_warmup else ""
                 logger.info(
                     f"[Policy {self.policy_id}] update={update+1}/{n_updates}"
                     f"{_warmup_tag}  alpha={alpha:.2f}  epsilon={epsilon:.3f}  "
-                    f"CVaR={_cvar:.3f}  lambda={_lam:.4f}"
+                    f"CVaR={_cvar:.3f}  mu_c={_mu_c:.3f}  sigma_c={_sigma_c:.3f}  "
+                    f"lambda={_lam:.4f}"
                 )
 
             if (update + 1) % self.cfg.get("save_every", 500) == 0:

@@ -80,6 +80,20 @@ class CVaRLagrangian:
         n_tail = max(1, int(np.ceil((1.0 - alpha) * len(sorted_costs))))
         return float(np.mean(sorted_costs[:n_tail]))
 
+    def cost_stats(self) -> Tuple[float, float]:
+        """
+        Mean and standard deviation of the buffered episode costs (mu_c, sigma_c).
+
+        Unlike estimate_cvar(), this covers the whole buffered distribution,
+        not just the tail — useful for telling apart a systemic cost increase
+        (mu_c rising) from a fat-tailed distribution driven by rare
+        catastrophic rollouts (sigma_c large relative to mu_c).
+        """
+        if len(self._costs) == 0:
+            return 0.0, 0.0
+        arr = np.array(self._costs, dtype=np.float64)
+        return float(arr.mean()), float(arr.std())
+
     # ------------------------------------------------------------------
     # Lagrangian update
     # ------------------------------------------------------------------
@@ -92,10 +106,11 @@ class CVaRLagrangian:
         """
         cvar_hat = self.estimate_cvar(alpha)
         constraint_violation = cvar_hat - epsilon
-        self._lambda = min(
-            self._lambda_max,
-            max(0.0, self._lambda + self._eta * constraint_violation),
-        )
+        self._lambda = max(0.0, self._lambda + self._eta * constraint_violation)
+        # self._lambda = min(
+        #     self._lambda_max,
+        #     self._lambda,
+        # )
         return self._lambda, cvar_hat
 
     # ------------------------------------------------------------------

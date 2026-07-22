@@ -496,7 +496,7 @@ def collect_expert_rollouts(n_rollouts: int,
 
         if (idx + 1) % 5 == 0 or (idx + 1) == len(scenarios):
             print(f"  [{idx + 1}/{len(scenarios)}] episodes collected "
-                  f"(ok: {len(episodes)})")
+                  f"(ok: {len(episodes)/(idx+1):.2%})", end='\r')
 
     if not episodes:
         raise RuntimeError(
