@@ -34,7 +34,7 @@ stage2:
   learning_rate: 1.0e-5    # lower than default (3e-4) — fine-tuning a large model
   save_every: 500
 
-eta_lambda: 0.01
+beta: 1.0                # fixed CVaR penalty weight (see CHANGES.md)
 alpha_start: 0.20
 alpha_end: 0.95
 n_curriculum_iters: 5000

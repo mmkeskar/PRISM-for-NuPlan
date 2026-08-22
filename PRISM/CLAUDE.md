@@ -12,6 +12,10 @@ This is a PhD research project targeting IEEE IV / IROS. The paper
 draft is in `docs/prism_paper.tex`. Every implementation decision must
 be consistent with the formulation in that paper.
 
+See `CHANGES.md` for a dated log of substantive changes to the codebase
+(what changed, why, and any implementation decisions made along the way) and
+`handoff.md` for session-by-session debugging notes.
+
 ---
 
 ## Repository Structure
@@ -38,7 +42,7 @@ prism/
 │   ├── morl/
 │   │   ├── utility_functions.py ← non-decreasing neural networks (Stage 1)
 │   │   ├── dpmorl_trainer.py   ← Stage 2 policy optimisation
-│   │   └── cvar_lagrangian.py  ← CVaR estimation + Lagrange update
+│   │   └── cvar_penalty.py     ← empirical CVaR + return capping (unconstrained penalty)
 │   ├── curriculum/
 │   │   └── alpha_schedule.py   ← alpha(n) and epsilon(n) curves
 │   └── utils/
@@ -181,20 +185,39 @@ w_j = sum_{i in O_j} W_i / (|O_j| * T_{j->i})
 sum_t(c_lead_j) <= mean(W_i for i in O_j)
 ```
 
-### CVaR Constraint with Alpha-Curriculum
+### CVaR Safety Penalty (unconstrained, with Alpha-Curriculum)
+
+**As of the CVaR refactor (see `CHANGES.md`), PRISM no longer constrains
+CVaR against a threshold via a Lagrange multiplier.** The old Lagrangian
+formulation (`lambda_k`, dual ascent, `epsilon` threshold from an IDM/expert
+baseline) is removed. CVaR is instead penalised directly, with a fixed
+weight, in the actor loss:
 
 ```
-alpha(n) = 0.20 + 0.75 * min(1, n / N_curriculum)
-epsilon(n) = epsilon_curve[alpha(n)]   # from hyperparams.json
-CVaR_{alpha(n)}(C^pi_k) <= epsilon(n)
+alpha(n) = 0.20 + 0.75 * min(1, n / N_curriculum)          # unchanged
+CVaR_alpha(C^pi_k) = empirical, from sorted rollout costs   # no Gaussian formula
+actor_loss = reward_loss + beta * CVaR_alpha(C^pi_k)        # no lambda, no threshold
 ```
 
-### Lagrangian Update
+`CVaR_alpha` is estimated empirically (sort episode costs, average the
+worst `ceil((1-alpha)*N)`), never via a Gaussian closed form
+(`mu_C + phi(...)/(1-alpha) * sigma_C`) — the two-tier safety cost
+distribution is right-skewed and violates the Gaussian assumption.
+
+**Return capping** (Rockafellar-Uryasev) lets every rollout episode
+contribute to the CVaR gradient, not just the worst `(1-alpha)` tail:
 
 ```
-effective_reward = R_t - lambda_k * c_t
-lambda_k = max(0, lambda_k + eta_lambda * (CVaR_hat - epsilon(n)))
+CVaR_alpha(X) = min_nu [ nu + 1/(1-alpha) * E[(X - nu)^+] ]
+capped_cost_i = VaR_alpha/N + max(0, C_i - VaR_alpha) / ((1-alpha) * N)
 ```
+
+The policy gradient for the cost term uses `capped_cost_i` as a REINFORCE
+weight on `log pi(a|s,w)` for every timestep of episode i (see
+`prism/morl/cvar_penalty.py` and `prism/morl/dpmorl_trainer.py`).
+
+`beta` is a fixed hyperparameter (`configs/*.yaml`), not learned and not
+updated via any dual/ascent rule.
 
 ### State Augmentation (DPMORL)
 
@@ -249,14 +272,14 @@ if result.returncode != 0:
 from prism.utils.hyperparams import load_hyperparams
 hp = load_hyperparams("hyperparams.json")
 sigma_j_sq = hp["reward_scaling"]["sigma_j_sq"]
-epsilon_curve = hp["epsilon_curve"]   # dict: "0.95" -> float  (keys are STRINGS)
 lead_times = hp["lead_times"]         # nested dict
 ```
 
-### epsilon_curve property
-`epsilon_curve` is **monotone increasing** with alpha. `CVaR_alpha` increases
-as alpha increases (stricter quantile → smaller tail → higher tail mean).
-Verify with `make check-hyperparams` after recomputing.
+Note: `hyperparams.json` no longer has an `epsilon_curve` key. There is no
+CVaR threshold — `beta` (the fixed penalty weight) lives in
+`configs/*.yaml`, not in the calibrated hyperparameter file. Expert
+rollouts (`collect_expert_rollouts`) are still used for reward scaling,
+indicator lead times, and z_t normalisation.
 
 ---
 
@@ -271,7 +294,6 @@ python scripts/train.py \
     --total_timesteps 10000000 \
     --n_rollouts_per_iter 512 \
     --gamma 0.99 \
-    --eta_lambda 0.01 \
     --n_curriculum_iters 5000 \
     --output_dir runs/prism_run_001
 ```
@@ -296,9 +318,12 @@ Each policy is trained independently with its own lambda_k.
    violation costs are capped per episode. Rationale: prevents
    cumulative indicator cost from exceeding outcome event costs.
 
-4. **Per-policy lambda_k, not shared**: each of K=5 policies has its
-   own Lagrange multiplier. Rationale: different style preferences
-   produce different safety cost distributions.
+4. **Per-policy episode-cost buffer, shared beta**: each of K=5 policies
+   maintains its own rolling `EpisodeCostBuffer` and CVaR/VaR estimate
+   (different style preferences produce different safety cost
+   distributions), but `beta` itself is a single fixed hyperparameter
+   shared across all K policies -- it is not learned and not per-policy.
+   (This replaces the old per-policy Lagrange multiplier `lambda_k`.)
 
 5. **Trajectory-level CVaR, not timestep-level**: CVaR is computed
    over C^i = sum(gamma^t * c_t) per rollout. Rationale: captures
@@ -323,7 +348,7 @@ Each policy is trained independently with its own lambda_k.
 | nuPlan gym env | `prism/env/nuplan_env.py` |
 | Utility functions | `prism/morl/utility_functions.py` |
 | DPMORL Stage 2 | `prism/morl/dpmorl_trainer.py` |
-| CVaR + Lagrangian | `prism/morl/cvar_lagrangian.py` |
+| CVaR penalty | `prism/morl/cvar_penalty.py` |
 | Alpha curriculum | `prism/curriculum/alpha_schedule.py` |
 | z_t normalisation | `prism/utils/zt_normaliser.py` |
 | Hyperparam loading | `prism/utils/hyperparams.py` |
@@ -373,15 +398,15 @@ Each policy is trained independently with its own lambda_k.
 - **Safety cost is always >= 0**: never return negative safety cost.
 - **gamma = 0.99** everywhere: in rewards, z_t accumulation, and
   CVaR computation. Changing this requires rerunning hyperparams.
-- **JSON keys for epsilon_curve are strings**: e.g. "0.95", not 0.95.
-  Always use `str(alpha)` as key and `float(hp["epsilon_curve"][str(alpha)])`.
-- **EMA beta = 0.01** for z_t normalisation update during training.
+- **EMA beta = 0.01** for z_t normalisation update during training (unrelated
+  to the CVaR penalty weight, also named `beta`, in `configs/*.yaml`).
 - **Blind spot geometry**: defined as ±45° to ±135° from ego heading,
   within 10m longitudinal and 4m lateral of ego centre.
-- **epsilon_curve keys are strings**: JSON keys for epsilon_curve are e.g.
-  `"0.95"` not `0.95`. Always use `str(round(alpha, 2))` as the lookup key.
-- **epsilon_curve is monotone increasing**: `CVaR_alpha` increases with alpha.
-  A curve that decreases indicates a bug in safety cost collection.
+- **Three different `beta`s -- do not confuse them**: `reward_scaling.beta`
+  (speed-shortfall scaling for `r_progress`, from `hyperparams.json`),
+  `ZtNormaliser`'s EMA `beta=0.01` (z_t running-average rate), and the CVaR
+  penalty weight `beta` in `configs/*.yaml` (fixed, e.g. `1.0`) are
+  unrelated hyperparameters that happen to share a name.
 - **angular_velocity not in mini DB**: `DynamicCarState.angular_velocity`
   returns 0.0 for all ego states in the nuPlan mini dataset. Fall back to
   `np.gradient(savgol_filter(heading_array, 7, 2), dt)`.
@@ -445,10 +470,18 @@ CaRL dependencies, and `pip install -e .` for the PRISM package itself. See
 - Do not modify `hyperparams.json` by hand
 - Do not add safety signals to the style reward functions
 - Do not add style signals to the safety cost
-- Do not use a shared lambda across all K policies
 - Do not use CaRL's reward function
 - Do not hardcode scaling parameters -- always read from hyperparams.json
 - Do not compute CVaR at timestep level -- always at trajectory level
+- Do not reintroduce a Lagrange multiplier / dual update for the safety
+  constraint, or a threshold (`epsilon`/`d`) calibrated from the IDM/expert
+  baseline. PRISM's safety objective is an unconstrained penalty
+  (`beta * CVaR_alpha`, fixed `beta`) -- see `CHANGES.md` for why the
+  constrained formulation was replaced.
+- Do not estimate CVaR via a Gaussian closed form
+  (`mu_C + phi(Phi^-1(alpha))/(1-alpha) * sigma_C`). Always use the
+  empirical/return-capped estimators in `prism/morl/cvar_penalty.py` --
+  the two-tier safety cost distribution is right-skewed.
 - Do not add inline comments after values in `lab.env` — GNU Make parses
   `VAR=value   # comment` as the value including trailing spaces and the `#`.
   Put all comments on their own line.

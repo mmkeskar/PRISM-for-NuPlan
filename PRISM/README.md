@@ -80,9 +80,12 @@ make check-hyperparams  # validate with colour-coded PASS/WARN/FAIL output
 ```
 
 `hyperparams-mini` replays 200 nuPlan expert trajectories to calibrate reward
-scaling, safety cost weights, and the CVaR epsilon curve. All values must pass
-`check-hyperparams` before training. Use `make hyperparams` (full dataset) before
-a real training run if mini statistics look marginal.
+scaling, safety cost indicator weights, and z_t normalisation statistics. All
+values must pass `check-hyperparams` before training. Use `make hyperparams`
+(full dataset) before a real training run if mini statistics look marginal.
+Note: the CVaR safety objective is an unconstrained penalty (`beta * CVaR`,
+fixed `beta` in the training config) -- there is no threshold calibrated
+from expert rollouts (see `CHANGES.md`).
 
 ### Step 7 — Smoke-test training
 
@@ -155,8 +158,8 @@ python scripts/train.py \
 ```
 
 No backbone phase flags needed. A single training run covers both Stage 1
-(utility function initialisation) and Stage 2 (per-policy PPO with CVaR
-Lagrangian) for all K=5 policies sequentially.
+(utility function initialisation) and Stage 2 (per-policy PPO with an
+unconstrained CVaR penalty) for all K=5 policies sequentially.
 
 ---
 

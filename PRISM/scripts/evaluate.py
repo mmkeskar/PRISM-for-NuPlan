@@ -32,7 +32,7 @@ import torch
 import yaml
 
 from prism.morl.utility_functions import UtilityFunction
-from prism.morl.cvar_lagrangian import compute_episode_cost, cvar_from_episodes
+from prism.morl.cvar_penalty import compute_episode_cost, compute_empirical_cvar
 from prism.utils.hyperparams import load_hyperparams
 from prism.utils.zt_normaliser import ZtNormaliser
 
@@ -200,7 +200,6 @@ def main():
         env = _build_env(
             cfg=cfg, hp=hp,
             utility_fn=utility_fn,
-            lambda_k=0.0,          # no Lagrangian during eval
             zt_normaliser=zt_normaliser,
         )
 
@@ -218,12 +217,13 @@ def main():
             all_pareto_points.append(mean_zt)
             logger.info(f"  Mean z_T: {mean_zt.round(3)}")
 
-        # CVaR at alpha=0.95
+        # CVaR at alpha=0.95 (diagnostic only -- no threshold to compare against;
+        # the unconstrained penalty formulation has no epsilon)
         costs = [r["cumulative_cost"] for r in results]
-        cvar95 = cvar_from_episodes(costs, alpha=0.95)
-        from prism.utils.hyperparams import get_epsilon
-        eps95 = get_epsilon(hp, 0.95)
-        logger.info(f"  CVaR@0.95={cvar95:.4f}  epsilon@0.95={eps95:.4f}  safe={cvar95 <= eps95}")
+        cvar95 = compute_empirical_cvar(costs, alpha=0.95)
+        mu_c = float(np.mean(costs)) if costs else 0.0
+        sigma_c = float(np.std(costs)) if costs else 0.0
+        logger.info(f"  CVaR@0.95={cvar95:.4f}  mu_c={mu_c:.4f}  sigma_c={sigma_c:.4f}")
 
     # Save all Pareto points
     if all_pareto_points:

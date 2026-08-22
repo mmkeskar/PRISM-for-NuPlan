@@ -1,7 +1,7 @@
 """
-Alpha and epsilon curriculum schedules for PRISM.
+Alpha curriculum schedule for PRISM.
 
-alpha(n) controls how conservative the CVaR constraint is:
+alpha(n) controls how conservative the CVaR penalty is:
     - Small alpha (0.20)  -> only the worst 20% of episodes matter (lenient)
     - Large alpha (0.95)  -> almost all episodes must satisfy the constraint (strict)
 
@@ -10,13 +10,12 @@ learns to drive at all, then gradually becomes safer.
 
     alpha(n) = alpha_start + (alpha_end - alpha_start) * min(1, n / N_curriculum)
 
-epsilon(n) = epsilon_curve[alpha(n)]  -- read from hyperparams.json
+There is no epsilon/threshold anymore -- CVaR_alpha(C^pi) is penalised
+directly in the actor loss via a fixed weight beta (see cvar_penalty.py),
+not constrained against a threshold read from hyperparams.json.
 """
 
 import numpy as np
-from typing import Dict
-
-from prism.utils.hyperparams import get_epsilon
 
 
 def compute_alpha(n: int, alpha_start: float, alpha_end: float, n_curriculum: int) -> float:
@@ -25,31 +24,22 @@ def compute_alpha(n: int, alpha_start: float, alpha_end: float, n_curriculum: in
     return alpha_start + (alpha_end - alpha_start) * frac
 
 
-def compute_epsilon(alpha: float, hp: Dict) -> float:
-    """Return the CVaR tolerance epsilon for the given alpha."""
-    return get_epsilon(hp, alpha)
-
-
 class AlphaSchedule:
-    """Stateful schedule tracking alpha/epsilon over training iterations."""
+    """Stateful schedule tracking alpha over training iterations."""
 
     def __init__(
         self,
-        hp: Dict,
         alpha_start: float = 0.20,
         alpha_end: float = 0.95,
         n_curriculum: int = 5000,
     ) -> None:
-        self._hp = hp
         self._alpha_start = alpha_start
         self._alpha_end = alpha_end
         self._n_curriculum = n_curriculum
 
-    def get(self, n: int):
-        """Return (alpha, epsilon) for training iteration n."""
-        alpha = compute_alpha(n, self._alpha_start, self._alpha_end, self._n_curriculum)
-        epsilon = compute_epsilon(alpha, self._hp)
-        return alpha, epsilon
+    def get(self, n: int) -> float:
+        """Return alpha for training iteration n."""
+        return compute_alpha(n, self._alpha_start, self._alpha_end, self._n_curriculum)
 
     def alpha_grid(self, n_steps: int = 200):
         """Return the full alpha trajectory for plotting."""

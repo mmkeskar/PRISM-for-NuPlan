@@ -174,7 +174,6 @@ def _plot_summary(zt, rvec, cost, path: Path, ep: int) -> None:
 
 _PLACEHOLDER_HP = {
     "reward_scaling": {"sigma_j_sq": 1.0, "beta": 0.5, "gamma_a": 1.0, "phi": 0.3, "tau": 2.0},
-    "epsilon_curve": {str(round(a, 2)): 50.0 for a in np.arange(0.20, 1.01, 0.05)},
     "lead_times": {},
     "indicator_weights": {"ttc": 2.0, "thw": 1.5, "speed": 1.0, "blind_spot": 1.5, "red_light": 2.0},
     "indicator_caps": {"ttc": 80.0, "thw": 73.0, "speed": 93.0, "blind_spot": 90.0, "red_light": 80.0},
@@ -287,7 +286,7 @@ def _build_env(scenario_sampler, hp: dict, gamma: float = 0.99,
         observation_builder=observation_builder,
         environment_area=environment_area,
         utility_fn=utility_fn.as_callable(),
-        lambda_k=0.0, gamma=gamma,
+        gamma=gamma,
         zt_normaliser=zt_normaliser,
         terminate_on_failure=False,
     )

@@ -43,7 +43,6 @@ from prism.morl.utility_functions import (
     train_utility_functions_stage1,
 )
 from prism.morl.dpmorl_trainer import DPMORLTrainer
-from prism.morl.cvar_lagrangian import CVaRLagrangian
 from prism.utils.hyperparams import load_hyperparams
 from prism.utils.zt_normaliser import ZtNormaliser
 
@@ -80,7 +79,7 @@ def _require_hyperparams(path: str) -> None:
 # Environment factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_env(cfg: dict, hp: dict, utility_fn, lambda_k: float, zt_normaliser):
+def _build_env(cfg: dict, hp: dict, utility_fn, zt_normaliser):
     """
     Build a PRISMEnv by directly instantiating CaRL components.
     No Hydra / OmegaConf builders needed.
@@ -187,7 +186,6 @@ def _build_env(cfg: dict, hp: dict, utility_fn, lambda_k: float, zt_normaliser):
         observation_builder=observation_builder,
         environment_area=environment_area,
         utility_fn=utility_fn.as_callable(),
-        lambda_k=lambda_k,
         gamma=cfg.get("gamma", 0.99),
         zt_normaliser=zt_normaliser,
         terminate_on_failure=False,
@@ -410,7 +408,6 @@ def run_stage2(
         env = _build_env(
             cfg=cfg, hp=hp,
             utility_fn=utility_fn,
-            lambda_k=0.0,
             zt_normaliser=zt_normaliser,
         )
 
@@ -461,8 +458,8 @@ def run_stage2(
 
         logger.info(
             f"[Stage 2] Policy {k} done.  "
-            f"Final lambda={summary['lambda_history'][-1]:.4f}  "
-            f"Final CVaR={summary['cvar_history'][-1]:.4f}"
+            f"Final CVaR={summary['cvar_history'][-1]:.4f}  "
+            f"Final actor_loss={summary['actor_loss_history'][-1]:.4f}"
         )
 
         # Save summary
@@ -471,8 +468,12 @@ def run_stage2(
             json.dump(
                 {
                     "policy_id": k,
-                    "lambda_history": summary["lambda_history"],
                     "cvar_history": summary["cvar_history"],
+                    "mu_c_history": summary["mu_c_history"],
+                    "sigma_c_history": summary["sigma_c_history"],
+                    "reward_loss_history": summary["reward_loss_history"],
+                    "cost_penalty_history": summary["cost_penalty_history"],
+                    "actor_loss_history": summary["actor_loss_history"],
                     "episode_zts": [z.tolist() for z in summary["episode_zts"]],
                 },
                 f,

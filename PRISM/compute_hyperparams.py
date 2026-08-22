@@ -26,9 +26,11 @@ Reward scaling:
     phi          : heading error scaling for lateral discipline
     tau          : TTC scaling for spacing
 
-CVaR epsilon curve:
-    epsilon_curve : dict mapping alpha -> CVaR_alpha(C^expert)
-                    at alphas [0.20, 0.30, ..., 0.95]
+Note: expert rollouts no longer produce a CVaR threshold (epsilon_curve).
+PRISM's safety objective is an unconstrained penalty (beta * CVaR_alpha),
+fixed in configs/prism_default.yaml, not a constraint calibrated from the
+IDM/expert baseline. Expert rollouts are still collected and still used
+for reward scaling, lead times, and z_t normalisation below.
 
 Safety cost lead times (T_{j->i}):
     lead_times   : dict mapping indicator_name -> {outcome_name: T_mean}
@@ -53,10 +55,6 @@ from typing import Dict, List, Tuple
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
-
-ALPHA_VALUES = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45,
-                0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
-                0.80, 0.85, 0.90, 0.95, 0.99]
 
 # Indicator -> list of outcomes it can precede
 # Used for weight derivation and lead-time estimation
@@ -244,15 +242,15 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
     # ── 6. Safety cost + indicator/outcome events ─────────────────────────────
     # Expert trajectories rarely trigger outcome events.  We record indicator
     # firings (TTC, THW) and assign bootstrap per-step costs derived from
-    # physics-based fallback lead times and outcome weights.  These are used
-    # only to produce a non-zero epsilon_curve; the actual calibrated weights
-    # are computed afterward by derive_indicator_weights().
+    # physics-based fallback lead times and outcome weights.  These per-step
+    # costs feed compute_episode_cost() for diagnostics (cum_cost); the
+    # calibrated indicator_weights used at training time are computed
+    # afterward by derive_indicator_weights(), independent of this bootstrap.
     #
     # Bootstrap indicator weights from fallback lead times (physics-based):
     #   w_ttc  = mean(W_i / T_{ttc->i}) ≈ mean(80/15, 80/15, 40/15) ≈ 4.9
     #   w_thw  = mean(W_i / T_{thw->i}) ≈ mean(80/20, 80/20, 40/20) ≈ 3.7
-    # These match the calibrated indicator_weights in the output, so the
-    # epsilon_curve represents a realistic "safe driver" cost distribution.
+    # These match the calibrated indicator_weights in the output.
     _W_TTC = sum(OUTCOME_WEIGHTS[o] / _fallback_lead_time("ttc", o)
                  for o in INDICATOR_OUTCOME_MAP["ttc"]) / len(INDICATOR_OUTCOME_MAP["ttc"])
     _W_THW = sum(OUTCOME_WEIGHTS[o] / _fallback_lead_time("thw", o)
@@ -534,22 +532,6 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     }
 
 
-def compute_cvar_epsilon_curve(episodes: List[Dict],
-                               gamma: float = 0.99) -> Dict[str, float]:
-    """
-    Compute the expert CVaR curve: alpha -> CVaR_alpha(C^expert).
-    Returns a dict with string keys (for JSON serialisation).
-    """
-    cum_costs = np.array([ep["cum_cost"] for ep in episodes])
-    epsilon_curve = {}
-    for alpha in ALPHA_VALUES:
-        sorted_costs = np.sort(cum_costs)[::-1]  # descending
-        n_tail = max(1, int(np.ceil((1 - alpha) * len(sorted_costs))))
-        cvar = float(np.mean(sorted_costs[:n_tail]))
-        epsilon_curve[str(alpha)] = cvar
-    return epsilon_curve
-
-
 def compute_lead_times(episodes: List[Dict]) -> Dict[str, Dict[str, float]]:
     """
     For each indicator-outcome pair, estimate the mean lead time T_{j->i}:
@@ -690,9 +672,6 @@ def main():
     print("[compute_hyperparams] Computing reward scaling parameters...")
     scaling = compute_reward_scaling(episodes)
 
-    print("[compute_hyperparams] Computing CVaR epsilon curve...")
-    epsilon_curve = compute_cvar_epsilon_curve(episodes, gamma=args.gamma)
-
     print("[compute_hyperparams] Estimating indicator lead times...")
     lead_times = compute_lead_times(episodes)
 
@@ -710,7 +689,6 @@ def main():
             "nuplan_data_root":  args.nuplan_data_root,
         },
         "reward_scaling":     scaling,
-        "epsilon_curve":      epsilon_curve,
         "lead_times":         lead_times,
         "indicator_weights":  ind_params["indicator_weights"],
         "indicator_caps":     ind_params["indicator_caps"],
@@ -747,7 +725,6 @@ def main():
     print(f"  gamma_a    : {scaling['gamma_a']:.4f}")
     print(f"  phi        : {scaling['phi']:.4f}")
     print(f"  tau        : {scaling['tau']:.4f}")
-    print(f"  epsilon@0.95: {epsilon_curve['0.95']:.4f}")
     print(f"  indicator weights: {ind_params['indicator_weights']}")
 
 

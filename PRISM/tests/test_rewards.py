@@ -42,9 +42,6 @@ def default_hp():
             "tau": 2.0,
         },
         "floor_values": {"delta_d": 0.2},
-        "epsilon_curve": {
-            str(round(a, 2)): 50.0 for a in np.arange(0.20, 1.01, 0.05)
-        },
         "alpha_curriculum": {"alpha_start": 0.20, "alpha_end": 0.95},
     }
 
@@ -267,26 +264,24 @@ class TestZtNormaliser:
 
 class TestAlphaSchedule:
 
-    def test_starts_at_alpha_start(self, default_hp):
-        sched = AlphaSchedule(default_hp, alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
-        alpha, _ = sched.get(0)
-        assert alpha == pytest.approx(0.2, abs=1e-6)
+    def test_starts_at_alpha_start(self):
+        sched = AlphaSchedule(alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
+        assert sched.get(0) == pytest.approx(0.2, abs=1e-6)
 
-    def test_reaches_alpha_end(self, default_hp):
-        sched = AlphaSchedule(default_hp, alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
-        alpha, _ = sched.get(1000)
-        assert alpha == pytest.approx(0.95, abs=1e-6)
+    def test_reaches_alpha_end(self):
+        sched = AlphaSchedule(alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
+        assert sched.get(1000) == pytest.approx(0.95, abs=1e-6)
 
-    def test_monotone_increasing(self, default_hp):
-        sched = AlphaSchedule(default_hp, alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
-        alphas = [sched.get(n)[0] for n in range(0, 1001, 100)]
+    def test_monotone_increasing(self):
+        sched = AlphaSchedule(alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
+        alphas = [sched.get(n) for n in range(0, 1001, 100)]
         for a, b in zip(alphas, alphas[1:]):
             assert b >= a
 
-    def test_clamped_after_curriculum(self, default_hp):
-        sched = AlphaSchedule(default_hp, alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
-        alpha_end, _ = sched.get(1000)
-        alpha_over, _ = sched.get(5000)
+    def test_clamped_after_curriculum(self):
+        sched = AlphaSchedule(alpha_start=0.2, alpha_end=0.95, n_curriculum=1000)
+        alpha_end = sched.get(1000)
+        alpha_over = sched.get(5000)
         assert alpha_end == pytest.approx(alpha_over, abs=1e-6)
 
     def test_compute_alpha_formula(self):
@@ -301,49 +296,83 @@ class TestAlphaSchedule:
 
 class TestCVaR:
 
-    def test_cvar_from_episodes_basic(self):
-        from prism.morl.cvar_lagrangian import cvar_from_episodes
+    def test_empirical_cvar_basic(self):
+        from prism.morl.cvar_penalty import compute_empirical_cvar
         costs = list(range(1, 101))  # 1..100
         # CVaR at alpha=0.95: top 5% = [96..100], mean = 98
-        cvar = cvar_from_episodes(costs, alpha=0.95)
+        cvar = compute_empirical_cvar(costs, alpha=0.95)
         assert cvar == pytest.approx(98.0, abs=1.0)
 
-    def test_cvar_at_alpha_zero_is_mean(self):
+    def test_empirical_cvar_at_alpha_zero_is_mean(self):
         # CVaR_0 = expected value over the FULL distribution = mean.
         # (alpha=0 means "top 100% tail", not just the single worst.)
-        from prism.morl.cvar_lagrangian import cvar_from_episodes
+        from prism.morl.cvar_penalty import compute_empirical_cvar
         costs = [1, 5, 3, 9, 2]
-        cvar = cvar_from_episodes(costs, alpha=0.0)
+        cvar = compute_empirical_cvar(costs, alpha=0.0)
         assert cvar == pytest.approx(float(np.mean(costs)), rel=1e-6)
 
-    def test_cvar_at_high_alpha_is_single_worst(self):
+    def test_empirical_cvar_at_high_alpha_is_single_worst(self):
         # alpha=0.8, N=5: tail fraction = 1-0.8 = 0.2 → ceil(0.2*5) = 1 episode.
         # CVaR = mean of top-1 = max.
-        from prism.morl.cvar_lagrangian import cvar_from_episodes
+        from prism.morl.cvar_penalty import compute_empirical_cvar
         costs = [1, 5, 3, 9, 2]
-        cvar = cvar_from_episodes(costs, alpha=0.8)
+        cvar = compute_empirical_cvar(costs, alpha=0.8)
         assert cvar == pytest.approx(float(max(costs)), rel=1e-6)
 
-    def test_lagrangian_update_increases_lambda_when_violated(self):
-        from prism.morl.cvar_lagrangian import CVaRLagrangian
-        lag = CVaRLagrangian(eta_lambda=0.1)
-        # Add high costs so CVaR exceeds epsilon
-        for _ in range(100):
-            lag.add_episode(100.0)
-        lam, cvar = lag.update_lambda(alpha=0.95, epsilon=1.0)
-        assert lam > 0.0  # lambda should increase
+    def test_empirical_cvar_empty_batch_is_zero(self):
+        from prism.morl.cvar_penalty import compute_empirical_cvar
+        assert compute_empirical_cvar([], alpha=0.95) == 0.0
 
-    def test_lagrangian_lambda_clamped_non_negative(self):
-        from prism.morl.cvar_lagrangian import CVaRLagrangian
-        lag = CVaRLagrangian(eta_lambda=0.1, lambda_init=0.0)
-        # Add zero costs so CVaR < epsilon
-        for _ in range(100):
-            lag.add_episode(0.0)
-        lam, _ = lag.update_lambda(alpha=0.95, epsilon=50.0)
-        assert lam >= 0.0  # never negative
+    def test_return_capping_matches_empirical_cvar(self):
+        # Rockafellar-Uryasev identity: the capped-cost estimate must equal
+        # the direct empirical CVaR for the same batch and alpha.
+        from prism.morl.cvar_penalty import (
+            compute_cvar_with_return_capping,
+            compute_empirical_cvar,
+        )
+        rng = np.random.default_rng(0)
+        costs = rng.exponential(scale=50.0, size=200)  # right-skewed, like safety cost
+        for alpha in (0.5, 0.8, 0.95):
+            direct = compute_empirical_cvar(costs, alpha=alpha)
+            capped, _ = compute_cvar_with_return_capping(costs, alpha=alpha)
+            assert capped == pytest.approx(direct, rel=0.05)
+
+    def test_return_capping_uses_all_episodes(self):
+        # Every episode must receive a non-trivial capped-cost weight (unlike
+        # the direct definition, which only weights the top (1-alpha) tail).
+        from prism.morl.cvar_penalty import compute_cvar_with_return_capping
+        costs = list(range(1, 101))
+        _, capped_costs = compute_cvar_with_return_capping(costs, alpha=0.95)
+        assert len(capped_costs) == 100
+        assert np.all(capped_costs > 0.0)
+        assert capped_costs.sum() == pytest.approx(
+            compute_cvar_with_return_capping(costs, alpha=0.95)[0], rel=1e-6
+        )
+
+    def test_return_capping_empty_batch(self):
+        from prism.morl.cvar_penalty import compute_cvar_with_return_capping
+        cvar, capped = compute_cvar_with_return_capping([], alpha=0.95)
+        assert cvar == 0.0
+        assert len(capped) == 0
+
+    def test_episode_cost_buffer_rolling_window(self):
+        from prism.morl.cvar_penalty import EpisodeCostBuffer
+        buf = EpisodeCostBuffer(buffer_size=10)
+        for c in range(20):
+            buf.add_episode(float(c))
+        # Only the most recent 10 episodes are retained
+        assert len(buf) == 10
+        assert buf.costs == [float(c) for c in range(10, 20)]
+
+    def test_episode_cost_buffer_state_dict_roundtrip(self):
+        from prism.morl.cvar_penalty import EpisodeCostBuffer
+        buf = EpisodeCostBuffer(buffer_size=5)
+        buf.add_episodes([1.0, 2.0, 3.0])
+        restored = EpisodeCostBuffer.from_state_dict(buf.state_dict(), buffer_size=5)
+        assert restored.costs == buf.costs
 
     def test_compute_episode_cost(self):
-        from prism.morl.cvar_lagrangian import compute_episode_cost
+        from prism.morl.cvar_penalty import compute_episode_cost
         costs = [1.0, 1.0, 1.0]
         gamma = 0.99
         expected = 1.0 + 0.99 + 0.99**2

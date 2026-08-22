@@ -13,7 +13,10 @@ Architecture:
         • Augments observation's value_measurements slot with z_t_normalised
         • Computes DPMORL scalar reward:
               R_t = gamma^{-t} * [f_k(z_{t+1}) - f_k(z_t)]
-        • Applies Lagrangian penalty: effective_reward = R_t - lambda_k * c_t
+        • Returns R_t unmodified; the safety cost c_t is exposed via info
+          for the trainer to penalise directly in the actor loss
+          (beta * CVaR_alpha(C^pi) -- see prism/morl/cvar_penalty.py).
+          The environment no longer folds a penalty into the reward.
         • Updates z_t normaliser at episode end
 
 Observation space (unchanged from CaRL):
@@ -375,8 +378,12 @@ class PRISMEnv(EnvironmentWrapper):
     PRISM gymnasium environment.
 
     Wraps CaRL's EnvironmentWrapper, replacing the scalar reward with the
-    DPMORL-transformed Lagrangian reward:
-        R_t = gamma^{-t} * [f_k(z_{t+1}) - f_k(z_t)] - lambda_k * c_t
+    DPMORL-transformed reward:
+        R_t = gamma^{-t} * [f_k(z_{t+1}) - f_k(z_t)]
+
+    The safety cost c_t is exposed via info["safety_cost"] but is NOT
+    subtracted from the reward here -- the CVaR penalty is applied in the
+    trainer's actor loss (beta * CVaR_alpha(C^pi)), not per-step in the env.
 
     The observation's value_measurements slot (shape 4) is repurposed to
     carry z_t_normalised so the policy is aware of cumulative style returns.
@@ -387,8 +394,6 @@ class PRISMEnv(EnvironmentWrapper):
         f_k : np.ndarray (4,) -> float.  The current policy's utility function.
         Pass a lambda or UtilityFunction instance.  Can be updated between
         policies via set_utility_fn().
-    lambda_k : float
-        Current Lagrange multiplier for the safety constraint.
     gamma : float
         Discount factor (must match training — default 0.99).
     zt_normaliser : ZtNormaliser
@@ -399,14 +404,12 @@ class PRISMEnv(EnvironmentWrapper):
         self,
         *args,
         utility_fn: Callable[[np.ndarray], float],
-        lambda_k: float = 0.0,
         gamma: float = 0.99,
         zt_normaliser: Optional[ZtNormaliser] = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._utility_fn = utility_fn
-        self._lambda_k = lambda_k
         self._gamma = gamma
         self._zt_normaliser = zt_normaliser or ZtNormaliser(reward_dim=_REWARD_DIM)
 
@@ -414,14 +417,11 @@ class PRISMEnv(EnvironmentWrapper):
         self._t = 0
 
     # ------------------------------------------------------------------
-    # Utility function and Lagrange multiplier updates
+    # Utility function updates
     # ------------------------------------------------------------------
 
     def set_utility_fn(self, fn: Callable[[np.ndarray], float]) -> None:
         self._utility_fn = fn
-
-    def set_lambda(self, lam: float) -> None:
-        self._lambda_k = max(0.0, float(lam))
 
     # ------------------------------------------------------------------
     # Gymnasium interface
@@ -450,9 +450,6 @@ class PRISMEnv(EnvironmentWrapper):
         f_curr = float(self._utility_fn(self._zt))
         R_t = (self._gamma ** (-self._t)) * (f_next - f_curr)
 
-        # Lagrangian-penalised effective reward
-        effective_reward = float(R_t - self._lambda_k * c_t)
-
         # Update cumulative state
         self._zt = zt_next
         self._t += 1
@@ -468,7 +465,7 @@ class PRISMEnv(EnvironmentWrapper):
         if termination or truncation:
             info["episode_zt"] = self._zt.copy()
 
-        return obs, effective_reward, termination, truncation, info
+        return obs, R_t, termination, truncation, info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,7 +480,6 @@ def make_prism_env(
     observation_builder,
     environment_area,
     utility_fn: Callable[[np.ndarray], float],
-    lambda_k: float = 0.0,
     gamma: float = 0.99,
     zt_normaliser: Optional[ZtNormaliser] = None,
     terminate_on_failure: bool = False,
@@ -512,7 +508,6 @@ def make_prism_env(
         reward_builder=reward_builder,
         terminate_on_failure=terminate_on_failure,
         utility_fn=utility_fn,
-        lambda_k=lambda_k,
         gamma=gamma,
         zt_normaliser=zt_normaliser,
     )

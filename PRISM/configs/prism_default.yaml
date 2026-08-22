@@ -51,9 +51,12 @@ stage2:
   learning_rate: 3.0e-4
   save_every: 500               # save checkpoint every N updates
 
-# CVaR Lagrangian
-eta_lambda: 0.01                # dual step size
-cvar_buffer_size: 500           # rolling window of episodes for CVaR estimation
+# CVaR safety penalty (unconstrained -- see prism/morl/cvar_penalty.py)
+# actor_loss = reward_loss + beta * CVaR_alpha(C^pi)   (no lambda, no threshold)
+beta: 1.0                       # fixed CVaR penalty weight -- tune so beta*CVaR
+                                 # is roughly the same order of magnitude as
+                                 # reward_loss early in training (see CHANGES.md)
+cvar_buffer_size: 500           # rolling window of episodes for CVaR/VaR estimation
 
 # Alpha curriculum (tightens CVaR constraint over training)
 alpha_start: 0.20

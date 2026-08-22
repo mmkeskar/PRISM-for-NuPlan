@@ -79,7 +79,7 @@ def main(hp_path: str):
     # ── Required top-level keys ───────────────────────────────────────────────
     section("Required keys")
     REQUIRED = [
-        "reward_scaling", "epsilon_curve", "lead_times",
+        "reward_scaling", "lead_times",
         "indicator_weights", "indicator_caps", "outcome_weights",
         "z_normalisation", "alpha_curriculum", "safety_thresholds", "metadata",
     ]
@@ -98,38 +98,6 @@ def main(hp_path: str):
     check_range("tau",        sc.get("tau",        -1),  1.0,   6.0, "s")
     check_range("beta",       sc.get("beta",       -1),  0.4,   0.6)
     check_range("sigma_d",    sc.get("sigma_d",    -1),  0.15,  0.25, "m")
-
-    # ── CVaR epsilon curve ────────────────────────────────────────────────────
-    section("CVaR epsilon curve")
-    ec     = hp.get("epsilon_curve", {})
-    alphas = sorted(ec.keys(), key=float)
-    vals   = [ec[a] for a in alphas]
-
-    if len(vals) >= 2:
-        # CVaR_alpha increases with alpha: stricter quantile → higher tail mean
-        monotone  = all(vals[i] <= vals[i + 1] for i in range(len(vals) - 1))
-        curve_str = "  ".join(f"{a}:{v:.2f}" for a, v in zip(alphas[::4], vals[::4]))
-        msg = f"monotone increasing    {curve_str}"
-        if monotone:
-            pass_(msg)
-        else:
-            fail_(msg + "  ← CVaR_alpha must increase with alpha")
-    else:
-        fail_("epsilon_curve has fewer than 2 entries")
-
-    neg = [(a, v) for a, v in zip(alphas, vals) if v < 0]
-    if neg:
-        fail_(f"negative epsilon values: {neg}")
-    else:
-        pass_("all epsilon values >= 0")
-
-    nonzero = sum(1 for v in vals if v > 0)
-    if nonzero == 0:
-        fail_("all epsilon values are 0.0 — safety costs were not recorded in _extract_episode")
-    elif nonzero < len(vals) // 2:
-        warn_(f"only {nonzero}/{len(vals)} epsilon values non-zero — safety events may be under-counted")
-    else:
-        pass_(f"non-zero epsilon values: {nonzero}/{len(vals)}")
 
     # ── z_t normalisation ─────────────────────────────────────────────────────
     section("z_t normalisation")
