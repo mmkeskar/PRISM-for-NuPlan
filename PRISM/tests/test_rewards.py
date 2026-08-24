@@ -323,37 +323,72 @@ class TestCVaR:
         from prism.morl.cvar_penalty import compute_empirical_cvar
         assert compute_empirical_cvar([], alpha=0.95) == 0.0
 
-    def test_return_capping_matches_empirical_cvar(self):
-        # Rockafellar-Uryasev identity: the capped-cost estimate must equal
-        # the direct empirical CVaR for the same batch and alpha.
-        from prism.morl.cvar_penalty import (
-            compute_cvar_with_return_capping,
-            compute_empirical_cvar,
-        )
-        rng = np.random.default_rng(0)
-        costs = rng.exponential(scale=50.0, size=200)  # right-skewed, like safety cost
-        for alpha in (0.5, 0.8, 0.95):
-            direct = compute_empirical_cvar(costs, alpha=alpha)
-            capped, _ = compute_cvar_with_return_capping(costs, alpha=alpha)
-            assert capped == pytest.approx(direct, rel=0.05)
+    def test_update_var_matches_quantile(self):
+        from prism.morl.cvar_penalty import update_var
+        costs = list(range(1, 101))  # 1..100
+        # alpha=0.95 quantile of 1..100 (torch.quantile, linear interpolation)
+        nu = update_var(costs, alpha=0.95)
+        assert nu == pytest.approx(95.05, abs=0.5)
 
-    def test_return_capping_uses_all_episodes(self):
-        # Every episode must receive a non-trivial capped-cost weight (unlike
-        # the direct definition, which only weights the top (1-alpha) tail).
-        from prism.morl.cvar_penalty import compute_cvar_with_return_capping
-        costs = list(range(1, 101))
-        _, capped_costs = compute_cvar_with_return_capping(costs, alpha=0.95)
-        assert len(capped_costs) == 100
-        assert np.all(capped_costs > 0.0)
-        assert capped_costs.sum() == pytest.approx(
-            compute_cvar_with_return_capping(costs, alpha=0.95)[0], rel=1e-6
-        )
+    def test_update_var_clamps_alpha_below_one(self):
+        # alpha=1.0 must not raise or produce inf/nan -- clamped to 0.999 internally.
+        from prism.morl.cvar_penalty import update_var
+        costs = [1.0, 2.0, 3.0, 4.0, 5.0]
+        nu = update_var(costs, alpha=1.0)
+        assert np.isfinite(nu)
 
-    def test_return_capping_empty_batch(self):
-        from prism.morl.cvar_penalty import compute_cvar_with_return_capping
-        cvar, capped = compute_cvar_with_return_capping([], alpha=0.95)
-        assert cvar == 0.0
-        assert len(capped) == 0
+    def test_update_var_empty_batch_is_zero(self):
+        from prism.morl.cvar_penalty import update_var
+        assert update_var([], alpha=0.95) == 0.0
+
+    def test_g_nu_is_nondecreasing_and_positive(self):
+        from prism.morl.cvar_penalty import g_nu
+        nu, tau = 100.0, 20.0
+        es = np.linspace(0.0, 300.0, 50)
+        vals = [g_nu(float(e), nu, tau) for e in es]
+        assert all(v > 0.0 for v in vals)  # dense: never exactly zero
+        assert all(b >= a for a, b in zip(vals, vals[1:]))  # non-decreasing
+
+    def test_g_nu_requires_positive_tau(self):
+        from prism.morl.cvar_penalty import g_nu
+        with pytest.raises(ValueError):
+            g_nu(1.0, nu=1.0, tau=0.0)
+
+    def test_dense_cost_signal_telescopes(self):
+        # sum_t gamma^t * c~_t must equal g_nu(e_T) - g_nu(e_0) exactly,
+        # for ANY per-step cost trajectory (the core correctness property
+        # that makes GAE on c~_t a valid proxy for the g_nu(C^pi) objective).
+        from prism.morl.cvar_penalty import dense_cost_signal, g_nu
+
+        gamma = 0.99
+        nu, tau = 50.0, 15.0
+        rng = np.random.default_rng(42)
+        step_costs = rng.exponential(scale=3.0, size=37)  # right-skewed, like safety cost
+
+        e = 0.0
+        e_trace = [0.0]
+        for t, c in enumerate(step_costs):
+            e = e + (gamma ** t) * c
+            e_trace.append(e)
+
+        total = 0.0
+        for t, c in enumerate(step_costs):
+            c_tilde = dense_cost_signal(e_trace[t], e_trace[t + 1], nu, tau, t, gamma)
+            total += (gamma ** t) * c_tilde
+
+        expected = g_nu(e_trace[-1], nu, tau) - g_nu(e_trace[0], nu, tau)
+        assert total == pytest.approx(expected, rel=1e-6, abs=1e-9)
+
+    def test_dense_cost_signal_dense_below_var(self):
+        # Below VaR, c~_t must be nonzero whenever raw cost fires -- unlike
+        # the sparse hinge-difference alternative, which is exactly zero
+        # whenever both e_t and e_{t+1} stay below nu.  Use a nu only
+        # moderately above e_t (not astronomically far) so the density
+        # is numerically meaningful, not just technically nonzero.
+        from prism.morl.cvar_penalty import dense_cost_signal
+        nu, tau, gamma = 50.0, 20.0, 0.99
+        c_tilde = dense_cost_signal(e_t=10.0, e_tp1=13.0, nu=nu, tau=tau, t=5, gamma=gamma)
+        assert abs(c_tilde) > 1e-4
 
     def test_episode_cost_buffer_rolling_window(self):
         from prism.morl.cvar_penalty import EpisodeCostBuffer

@@ -51,12 +51,17 @@ stage2:
   learning_rate: 3.0e-4
   save_every: 500               # save checkpoint every N updates
 
-# CVaR safety penalty (unconstrained -- see prism/morl/cvar_penalty.py)
-# actor_loss = reward_loss + beta * CVaR_alpha(C^pi)   (no lambda, no threshold)
-beta: 1.0                       # fixed CVaR penalty weight -- tune so beta*CVaR
-                                 # is roughly the same order of magnitude as
-                                 # reward_loss early in training (see CHANGES.md)
-cvar_buffer_size: 500           # rolling window of episodes for CVaR/VaR estimation
+# CVaR safety penalty: state-augmented cost + dual critic (see prism/morl/cvar_penalty.py,
+# prism/morl/dpmorl_trainer.py). A_total = normalize(A_reward) - beta * normalize(A_cost),
+# both through the SAME PPO clipped-ratio objective. No lambda, no threshold, no REINFORCE.
+beta: 1.0                       # fixed combined-advantage penalty weight -- tune from
+                                 # early-training reward_loss/cost_penalty magnitudes
+                                 # (see CHANGES.md). Per-backbone: do not assume the
+                                 # value tuned here transfers to configs/prism_alpamayo.yaml.
+tau: 20.0                       # smoothness of the dense cost hinge g_nu(e) = tau*softplus((e-nu)/tau)
+                                 # -- must be commensurate with raw episode-cost scale (100s), not [0,1]
+cf_coef: 0.5                    # cost critic MSE loss coefficient (parallels vf_coef above)
+cvar_buffer_size: 500           # rolling window of episodes for the VaR/nu estimate
 
 # Alpha curriculum (tightens CVaR constraint over training)
 alpha_start: 0.20

@@ -22,10 +22,11 @@ import torch.nn as nn
 
 @dataclass
 class PolicyOutput:
-    action: torch.Tensor     # (batch, action_dim)
-    log_prob: torch.Tensor   # (batch,)  — sum over action dims
-    entropy: torch.Tensor    # (batch,)  — sum over action dims
-    value: torch.Tensor      # (batch,)
+    action: torch.Tensor      # (batch, action_dim)
+    log_prob: torch.Tensor    # (batch,)  — sum over action dims
+    entropy: torch.Tensor     # (batch,)  — sum over action dims
+    value: torch.Tensor       # (batch,)  — reward critic V(s, z_t)
+    cost_value: torch.Tensor  # (batch,)  — cost critic V^C(s, e_t), style-independent
 
 
 class PRISMPolicyBase(nn.Module, ABC):
@@ -45,12 +46,17 @@ class PRISMPolicyBase(nn.Module, ABC):
     ) -> PolicyOutput:
         """
         Args:
-            obs:     observation dict from PRISMEnv
+            obs:     observation dict from PRISMEnv.  In addition to the
+                     backend's usual keys, contains "cumulative_cost" —
+                     shape (batch, 1), the raw (unnormalised) discounted
+                     cumulative safety cost e_t — which subclasses should
+                     feed to their cost critic (and, where architecturally
+                     possible, to the actor for cost-aware conditioning).
             actions: if provided, evaluate log_prob of these specific actions
                      (PPO update pass). If None, sample from the policy
                      (rollout collection pass).
         Returns:
-            PolicyOutput(action, log_prob, entropy, value)
+            PolicyOutput(action, log_prob, entropy, value, cost_value)
         """
 
     def trainable_parameters(self) -> Iterator[nn.Parameter]:

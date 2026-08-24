@@ -294,12 +294,27 @@ def _build_agent(
             value_hidden_dims=tuple(alpamayo_cfg.get("critic_value_hidden_dims", [256, 128])),
         ).to(device)
 
+        # CVaR cost critic (v2) — separate weights, style_dim=1 (e_t alone,
+        # not [w_k, z_t]) since safety is style-independent. Reads the same
+        # backbone_hidden_states as `critic` above, no extra VLM forward pass.
+        cost_critic = QFormerCritic(
+            backbone_hidden_dim=alpamayo_cfg.get("backbone_hidden_dim", 4096),
+            n_queries=alpamayo_cfg.get("cost_critic_n_queries", 8),
+            query_dim=alpamayo_cfg.get("cost_critic_query_dim", 256),
+            n_heads=alpamayo_cfg.get("cost_critic_n_heads", 8),
+            style_dim=alpamayo_cfg.get("cost_critic_style_dim", 1),
+            value_hidden_dims=tuple(
+                alpamayo_cfg.get("cost_critic_value_hidden_dims", [256, 128])
+            ),
+        ).to(device)
+
         return AlpamayoAdapter(
             policy_id=policy_id,
             action_dim=cfg.get("action_space_dim", 128),
             reward_dim=reward_dim,
             init_log_std=alpamayo_cfg.get("init_log_std", -0.5),
             critic=critic,
+            cost_critic=cost_critic,
             extract_layers=alpamayo_cfg.get("critic_extract_layers", [22, 29, 35]),
             backbone_model_name=alpamayo_cfg.get("backbone_model_name"),
             backbone_phase=backbone_phase,
@@ -459,7 +474,8 @@ def run_stage2(
         logger.info(
             f"[Stage 2] Policy {k} done.  "
             f"Final CVaR={summary['cvar_history'][-1]:.4f}  "
-            f"Final actor_loss={summary['actor_loss_history'][-1]:.4f}"
+            f"Final var_nu={summary['var_nu_history'][-1]:.4f}  "
+            f"Final total_loss={summary['total_loss_history'][-1]:.4f}"
         )
 
         # Save summary
@@ -469,11 +485,13 @@ def run_stage2(
                 {
                     "policy_id": k,
                     "cvar_history": summary["cvar_history"],
+                    "var_nu_history": summary["var_nu_history"],
                     "mu_c_history": summary["mu_c_history"],
                     "sigma_c_history": summary["sigma_c_history"],
                     "reward_loss_history": summary["reward_loss_history"],
                     "cost_penalty_history": summary["cost_penalty_history"],
-                    "actor_loss_history": summary["actor_loss_history"],
+                    "cost_critic_loss_history": summary["cost_critic_loss_history"],
+                    "total_loss_history": summary["total_loss_history"],
                     "episode_zts": [z.tolist() for z in summary["episode_zts"]],
                 },
                 f,

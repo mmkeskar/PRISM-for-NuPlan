@@ -17,9 +17,16 @@ Action format:
 Integration problems status:
     [x] Problem 5 — StochasticActionHead: PPO-compatible log_prob/entropy
     [x] Problem 2 — QFormerCritic: style-conditioned value head on VLM features
-    [x] Problem 3 — z_t injection: normalised z_t in instruction string each step
+    [x] Problem 3 — z_t/e_t injection: instruction string tokenised and passed
+                    to the backbone as input_ids/attention_mask (v2 CVaR
+                    refactor -- previously built but never actually reaching
+                    the model; see the "verify on lab machine" note in
+                    _run_backbone() below for the one remaining risk)
     [x] Problem 4 — Backbone loading: frozen (Phase A) or LoRA (Phase B)
     [x] Problem 1 — Observation encoding: camera images instead of BEV raster
+    [x] CVaR cost critic (v2) — second QFormerCritic, style_dim=1 (e_t alone,
+                    NOT w_k), reads the same backbone_hidden_states as the
+                    reward critic, no extra backbone forward pass
 
 Phase A (frozen backbone):
     All backbone parameters frozen.  Only StochasticActionHead + QFormerCritic train.
@@ -59,6 +66,11 @@ class AlpamayoAdapter(PRISMPolicyBase):
         reward_dim:           style reward dimensions (4 in PRISM).
         init_log_std:         initial log-std for StochasticActionHead.
         critic:               QFormerCritic instance (or None → value = 0).
+        cost_critic:          QFormerCritic instance for the CVaR cost value
+                              V^C(s, e_t) (or None → cost_value = 0). Must be
+                              a SEPARATE instance from `critic` with
+                              style_dim=1 (e_t alone, not [w_k, z_t]) --
+                              safety is style-independent (v2 CVaR refactor).
         extract_layers:       VLM layer indices to extract for Q-Former.
                               Confirmed: [22, 29, 35] for 36-layer Alpamayo.
         backbone_model_name:  HuggingFace model id or local path. If None,
@@ -74,6 +86,7 @@ class AlpamayoAdapter(PRISMPolicyBase):
         reward_dim: int = 4,
         init_log_std: float = -0.5,
         critic: Optional[PRISMCriticBase] = None,
+        cost_critic: Optional[PRISMCriticBase] = None,
         extract_layers: Optional[List[int]] = None,
         backbone_model_name: Optional[str] = None,
         backbone_phase: str = "a",
@@ -105,11 +118,24 @@ class AlpamayoAdapter(PRISMPolicyBase):
         # ── Problem 2 (done): Q-Former critic ────────────────────────────────
         self.critic = critic
 
+        # ── CVaR cost critic (v2, done): separate Q-Former, style_dim=1 ───────
+        self.cost_critic = cost_critic
+
         # Preference vector w_k — set per policy via set_w_k()
         self.register_buffer("_w_k", torch.zeros(reward_dim))
 
+        # Current VaR threshold nu — set once per training update via
+        # set_nu() (mirrors set_w_k's per-policy, not per-step, cadence).
+        # Used only for the instruction-text margin sentence; the dense
+        # cost signal itself (cvar_penalty.py) reads nu directly from the
+        # trainer, not from here.
+        self._nu: Optional[float] = None
+
         # ── Problem 3 (done): instruction builder ─────────────────────────────
         self._instruction_builder: Optional[AlpamayoInstructionBuilder] = None
+
+        # ── Tokenizer, loaded alongside the backbone (v2) ─────────────────────
+        self._tokeniser = None
 
         # ── Problem 4 (done): backbone ────────────────────────────────────────
         self._backbone: Optional[nn.Module] = None
@@ -127,11 +153,17 @@ class AlpamayoAdapter(PRISMPolicyBase):
     def _load_backbone(self, model_name: str, phase: str) -> nn.Module:
         """Load Alpamayo and apply the appropriate parameter strategy."""
         try:
-            from transformers import AutoModel
+            from transformers import AutoModel, AutoTokenizer
         except ImportError:
             raise ImportError("transformers is required: pip install transformers")
 
         logger.info(f"[AlpamayoAdapter] Loading backbone: {model_name} (phase {phase.upper()})")
+
+        # Loaded once alongside the backbone so the instruction string (z_t,
+        # e_t, spatial state) can actually be tokenised and passed to the
+        # model in _run_backbone() -- previously built but discarded (see
+        # module docstring "Problem 3" note).
+        self._tokeniser = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
         backbone = AutoModel.from_pretrained(
             model_name,
@@ -195,6 +227,18 @@ class AlpamayoAdapter(PRISMPolicyBase):
         The forward API is based on architecture inspection.  Verify the exact
         attribute names (outputs.trajectory, outputs.hidden_states) when first
         running on the target machine with the model loaded.
+
+        HIGHEST-UNCERTAINTY STEP (v2 CVaR refactor): this passes `pixel_values`
+        and `input_ids`/`attention_mask` as independent kwargs. Qwen-VL-family
+        models (this backbone's language model, per the module docstring)
+        commonly require `input_ids` to already contain interleaved
+        image-placeholder tokens matched against `pixel_values` via a
+        processor/chat-template, NOT independent unrelated kwargs -- calling
+        them this way could silently produce wrong or ignored image
+        conditioning rather than erroring. Do a single isolated forward pass
+        with the real model on the lab machine (dummy pixel_values + a
+        tokenised instruction, inspect output keys/shapes) BEFORE trusting
+        this in the RL rollout loop.
         """
         if self._backbone is None:
             return None, None
@@ -212,21 +256,33 @@ class AlpamayoAdapter(PRISMPolicyBase):
         else:
             pixel_values = None
 
-        # TODO: tokenise instruction and pass to backbone
-        # tokeniser stored as self._tokeniser loaded alongside backbone in _load_backbone
-        # input_ids, attention_mask = self._tokeniser(instruction, return_tensors="pt", ...)
+        # ── Problem 3 (done): tokenise instruction and pass to backbone ───────
+        input_ids, attention_mask = None, None
+        if instruction is not None and self._tokeniser is not None:
+            tokenised = self._tokeniser(
+                instruction, return_tensors="pt", padding=True, truncation=True,
+            )
+            input_ids = tokenised["input_ids"].to(device)
+            attention_mask = tokenised["attention_mask"].to(device)
 
         with torch.set_grad_enabled(self._backbone_phase == "b"):
             outputs = self._backbone(
                 pixel_values=pixel_values,
-                # input_ids=input_ids,
-                # attention_mask=attention_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 output_hidden_states=True,
             )
 
         # ── Extract trajectory ─────────────────────────────────────────────────
         # Expected: outputs.trajectory shape (batch, 64, 2) or (batch, 128)
-        raw = getattr(outputs, "trajectory", None) or getattr(outputs, "logits", None)
+        # NOTE: `or` between tensors raises ("ambiguous truth value") once
+        # `outputs.trajectory` is a real multi-element tensor -- must check
+        # `is None` explicitly rather than rely on truthiness (pre-existing
+        # bug, found via the v2 smoke test; unrelated to the CVaR refactor
+        # but sits directly in this function).
+        raw = getattr(outputs, "trajectory", None)
+        if raw is None:
+            raw = getattr(outputs, "logits", None)
         if raw is not None:
             action_mean = raw.reshape(raw.shape[0], -1)[:, :self.action_dim]
         else:
@@ -266,6 +322,16 @@ class AlpamayoAdapter(PRISMPolicyBase):
         else:
             self._instruction_builder.update(self.policy_id, w_k_np)
 
+    def set_nu(self, nu: float) -> None:
+        """
+        Set the current VaR threshold nu, for the instruction text's
+        margin-to-nu sentence.  Called once per training update by the
+        trainer (mirrors set_w_k's per-policy, not per-step, update
+        cadence) -- NOT part of the dense cost signal computation itself,
+        which reads nu directly (see cvar_penalty.py / dpmorl_trainer.py).
+        """
+        self._nu = float(nu)
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -282,7 +348,7 @@ class AlpamayoAdapter(PRISMPolicyBase):
         # ── Step 1: camera images passed to backbone as pixel_values ─ Problem 1
         # obs["camera_images"] is extracted inside _run_backbone and passed as pixel_values.
 
-        # ── Step 2: build instruction (preamble + spatial + z_t) ── Problem 3
+        # ── Step 2: build instruction (preamble + spatial + z_t + e_t) ── Problem 3
         instruction: Optional[str] = None
         if self._instruction_builder is not None:
             z_t_val = obs.get("value_measurements")
@@ -303,7 +369,20 @@ class AlpamayoAdapter(PRISMPolicyBase):
                     spatial_desc = build_spatial_description({"spatial_state": s0})
                 else:
                     spatial_desc = ""
-                instruction = self._instruction_builder.build(z_t_np, spatial_desc=spatial_desc)
+
+                # e_t (cumulative safety cost) for the margin-to-nu sentence (v2)
+                e_t_val = obs.get("cumulative_cost")
+                e_t_float: Optional[float] = None
+                if e_t_val is not None:
+                    e_t_float = (
+                        float(e_t_val[0].item())
+                        if isinstance(e_t_val, torch.Tensor)
+                        else float(np.asarray(e_t_val[0]))
+                    )
+
+                instruction = self._instruction_builder.build(
+                    z_t_np, e_t=e_t_float, nu=self._nu, spatial_desc=spatial_desc,
+                )
 
         # ── Step 3: run Alpamayo backbone ─────────────────────── Problem 4
         action_mean, backbone_hidden_states = self._run_backbone(obs, instruction)
@@ -325,7 +404,30 @@ class AlpamayoAdapter(PRISMPolicyBase):
         else:
             value = torch.zeros(batch, device=device)
 
-        return PolicyOutput(action=act, log_prob=log_prob, entropy=entropy, value=value)
+        # ── Step 6: CVaR cost critic (v2) ─────────────── style-independent
+        # Reads the SAME (already detached) backbone_hidden_states -- no
+        # extra VLM forward pass -- conditioned on e_t alone, NOT w_k.
+        e_t = obs.get("cumulative_cost")
+        if e_t is None:
+            e_t = torch.zeros(batch, 1, device=device)
+        else:
+            e_t = (
+                e_t.float().to(device)
+                if isinstance(e_t, torch.Tensor)
+                else torch.from_numpy(np.asarray(e_t, dtype=np.float32)).to(device)
+            )
+            if e_t.dim() == 1:
+                e_t = e_t.unsqueeze(-1)
+
+        if self.cost_critic is not None and backbone_hidden_states is not None:
+            cost_value = self.cost_critic(backbone_hidden_states.detach(), e_t)
+        else:
+            cost_value = torch.zeros(batch, device=device)
+
+        return PolicyOutput(
+            action=act, log_prob=log_prob, entropy=entropy,
+            value=value, cost_value=cost_value,
+        )
 
     # ------------------------------------------------------------------
     # Trainable parameters
@@ -333,12 +435,14 @@ class AlpamayoAdapter(PRISMPolicyBase):
 
     def trainable_parameters(self):
         """
-        Phase A: action_head + critic (backbone fully frozen).
-        Phase B: LoRA adapter params + action_head + critic.
+        Phase A: action_head + critic + cost_critic (backbone fully frozen).
+        Phase B: LoRA adapter params + action_head + critic + cost_critic.
         """
         params = list(self.action_head.parameters())
         if self.critic is not None:
             params += list(self.critic.parameters())
+        if self.cost_critic is not None:
+            params += list(self.cost_critic.parameters())
         if self._backbone is not None and self._backbone_phase == "b":
             params += [p for p in self._backbone.parameters() if p.requires_grad]
         return iter(params)

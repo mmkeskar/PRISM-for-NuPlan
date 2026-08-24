@@ -34,7 +34,13 @@ stage2:
   learning_rate: 1.0e-5    # lower than default (3e-4) — fine-tuning a large model
   save_every: 500
 
-beta: 1.0                # fixed CVaR penalty weight (see CHANGES.md)
+# CVaR safety penalty: state-augmented cost + dual critic (see prism/morl/cvar_penalty.py).
+# beta must be re-tuned for this backbone independently of configs/prism_default.yaml --
+# the advantage-normalization design makes beta comparable across backbones in principle,
+# but confirm from early-training reward_loss/cost_penalty magnitudes regardless.
+beta: 1.0                # fixed combined-advantage penalty weight (see CHANGES.md)
+tau: 20.0                # dense cost hinge smoothness -- same scale guidance as prism_default.yaml
+cf_coef: 0.5              # cost critic MSE loss coefficient
 alpha_start: 0.20
 alpha_end: 0.95
 n_curriculum_iters: 5000
@@ -77,6 +83,15 @@ alpamayo:
   critic_n_heads: 8                # attention heads in cross-attention
   critic_style_dim: 8              # len(w_k) + len(z_t) = 4 + 4
   critic_value_hidden_dims: [256, 128]
+
+  # CVaR cost critic (v2, separate weights, NOT conditioned on w_k -- safety
+  # is style-independent). Reuses the reward critic's extraction layers and
+  # attention shape; only style_dim differs (e_t alone, not [w_k, z_t]).
+  cost_critic_n_queries: 8
+  cost_critic_query_dim: 256
+  cost_critic_n_heads: 8
+  cost_critic_style_dim: 1         # e_t alone
+  cost_critic_value_hidden_dims: [256, 128]
 
   # Trajectory output (matches Alpamayo's action_space config)
   n_waypoints: 64

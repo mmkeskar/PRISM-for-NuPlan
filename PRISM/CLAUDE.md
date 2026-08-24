@@ -42,9 +42,9 @@ prism/
 │   ├── morl/
 │   │   ├── utility_functions.py ← non-decreasing neural networks (Stage 1)
 │   │   ├── dpmorl_trainer.py   ← Stage 2 policy optimisation
-│   │   └── cvar_penalty.py     ← empirical CVaR + return capping (unconstrained penalty)
+│   │   └── cvar_penalty.py     ← state-augmented cost, VaR/nu, dense signal (g_nu)
 │   ├── curriculum/
-│   │   └── alpha_schedule.py   ← alpha(n) and epsilon(n) curves
+│   │   └── alpha_schedule.py   ← alpha(n) curriculum (no epsilon — see CVaR section)
 │   └── utils/
 │       ├── hyperparams.py      ← load hyperparams.json
 │       └── zt_normaliser.py    ← z_t running normalisation with EMA
@@ -185,39 +185,66 @@ w_j = sum_{i in O_j} W_i / (|O_j| * T_{j->i})
 sum_t(c_lead_j) <= mean(W_i for i in O_j)
 ```
 
-### CVaR Safety Penalty (unconstrained, with Alpha-Curriculum)
+### CVaR Safety Penalty — state-augmented cost + dual critic (v2)
 
-**As of the CVaR refactor (see `CHANGES.md`), PRISM no longer constrains
-CVaR against a threshold via a Lagrange multiplier.** The old Lagrangian
-formulation (`lambda_k`, dual ascent, `epsilon` threshold from an IDM/expert
-baseline) is removed. CVaR is instead penalised directly, with a fixed
-weight, in the actor loss:
-
-```
-alpha(n) = 0.20 + 0.75 * min(1, n / N_curriculum)          # unchanged
-CVaR_alpha(C^pi_k) = empirical, from sorted rollout costs   # no Gaussian formula
-actor_loss = reward_loss + beta * CVaR_alpha(C^pi_k)        # no lambda, no threshold
-```
-
-`CVaR_alpha` is estimated empirically (sort episode costs, average the
-worst `ceil((1-alpha)*N)`), never via a Gaussian closed form
-(`mu_C + phi(...)/(1-alpha) * sigma_C`) — the two-tier safety cost
-distribution is right-skewed and violates the Gaussian assumption.
-
-**Return capping** (Rockafellar-Uryasev) lets every rollout episode
-contribute to the CVaR gradient, not just the worst `(1-alpha)` tail:
+**PRISM does not constrain CVaR against a threshold, and does not use
+REINFORCE.** (v1 tried an unconstrained REINFORCE-style penalty; code
+review found it violated the envelope theorem and had no importance-ratio
+correction across PPO's epochs — see `CHANGES.md` for the full account.)
+v2 extends DPMORL's own state-augmentation trick — already used for the
+reward side below — to the safety cost, and trains a **separate cost
+critic** through the same PPO machinery as the reward critic:
 
 ```
-CVaR_alpha(X) = min_nu [ nu + 1/(1-alpha) * E[(X - nu)^+] ]
-capped_cost_i = VaR_alpha/N + max(0, C_i - VaR_alpha) / ((1-alpha) * N)
+e_t = cumulative discounted safety cost               # mirrors z_t exactly
+e_{t+1} = e_t + gamma^t * c_t                          # e_0 = 0 each episode
+nu = quantile(episode_costs, alpha)                    # VaR threshold, updated
+                                                        # once per training update
+                                                        # from a rolling episode buffer
+g_nu(e) = tau * softplus((e - nu) / tau)               # FIXED smooth hinge at nu
+                                                        # (not learned, not per-policy)
+c~_t = gamma^{-t} * [g_nu(e_{t+1}) - g_nu(e_t)]         # dense per-timestep cost signal
 ```
 
-The policy gradient for the cost term uses `capped_cost_i` as a REINFORCE
-weight on `log pi(a|s,w)` for every timestep of episode i (see
-`prism/morl/cvar_penalty.py` and `prism/morl/dpmorl_trainer.py`).
+`c~_t` telescopes exactly to `g_nu(C^pi) - g_nu(0)` for the same reason
+`R_t` below telescopes to `f(z_T) - f(z_0)` — the `gamma^{-t}` prefactor
+cancels GAE's `gamma^l` discounting. It is dense (nonzero whenever raw cost
+fires) because `g_nu` is a smooth softplus hinge, not a hard `(e-nu)^+`.
+**Do not use the naive `(e_{t+1}-nu)^+ - (e_t-nu)^+` difference** — it is
+sparse (exactly zero whenever both `e_t` and `e_{t+1}` are below `nu`),
+which is the density problem `g_nu` exists to avoid.
 
-`beta` is a fixed hyperparameter (`configs/*.yaml`), not learned and not
-updated via any dual/ascent rule.
+`c~_t` feeds a cost critic `V^C(s, e_t)` via GAE, exactly parallel to how
+the reward critic is trained on `R_t`. Reward and cost combine into a
+single PPO update:
+
+```
+A_total = normalize(A_reward) - beta * normalize(A_cost)   # both streams
+ppo_loss = clip(A_total, ratio)                             # ONE ratio, ONE clip
+total_loss = ppo_loss + vf_coef*v_loss + cf_coef*cost_critic_loss - ent_coef*ent_loss
+```
+
+Reward and cost share the same importance ratio, clip, and epochs — there
+is no separate REINFORCE term, so the v1 off-policy-drift and
+envelope-theorem bugs cannot recur by construction. `beta` and `tau` are
+fixed hyperparameters (`configs/*.yaml`), not learned. `beta` must be
+tuned per backbone (CaRL vs. Alpamayo) even though advantage normalisation
+makes it more portable than v1's raw-log-prob-scaled weight was.
+
+Alpamayo's actor also conditions on `e_t`/`nu` via the same instruction-text
+mechanism used for `z_t` (`prism/models/alpamayo/instruction.py`,
+`AlpamayoAdapter.set_nu()`), tokenised and passed to the backbone as
+`input_ids`/`attention_mask` — this was previously built but never actually
+reaching the model; see `prism/models/alpamayo/adapter.py`'s `_run_backbone()`
+for the one remaining risk (Qwen-VL-family models may require image
+placeholder tokens interleaved via a processor, not independent kwargs —
+verify on the lab machine before trusting it in the RL loop).
+
+See `prism/morl/cvar_penalty.py` (`g_nu`, `dense_cost_signal`, `update_var`)
+and `prism/morl/dpmorl_trainer.py` (dual GAE, combined loss) for the
+implementation, and `CHANGES.md` for the full derivation and the Muni et
+al. (arXiv:2602.03778) formula-verification notes that motivated the `g_nu`
+construction over a literal transcription of that paper.
 
 ### State Augmentation (DPMORL)
 
@@ -299,7 +326,9 @@ python scripts/train.py \
 ```
 
 Training runs K=5 policies sequentially (or in parallel if multi-GPU).
-Each policy is trained independently with its own lambda_k.
+Each policy is trained independently with its own cost critic and rolling
+episode-cost buffer (see Key Design Decision #4 below); `beta` and `tau`
+are shared, fixed hyperparameters, not per-policy state.
 
 ---
 
@@ -318,12 +347,13 @@ Each policy is trained independently with its own lambda_k.
    violation costs are capped per episode. Rationale: prevents
    cumulative indicator cost from exceeding outcome event costs.
 
-4. **Per-policy episode-cost buffer, shared beta**: each of K=5 policies
-   maintains its own rolling `EpisodeCostBuffer` and CVaR/VaR estimate
-   (different style preferences produce different safety cost
-   distributions), but `beta` itself is a single fixed hyperparameter
-   shared across all K policies -- it is not learned and not per-policy.
-   (This replaces the old per-policy Lagrange multiplier `lambda_k`.)
+4. **Per-policy episode-cost buffer and cost critic, shared beta/tau**: each
+   of K=5 policies maintains its own rolling `EpisodeCostBuffer`, VaR (`nu`)
+   estimate, and cost critic `V^C(s, e_t)` weights (different style
+   preferences produce different safety cost distributions), but `beta` and
+   `tau` are single fixed hyperparameters shared across all K policies --
+   neither is learned or per-policy. (This replaces the old per-policy
+   Lagrange multiplier `lambda_k`.)
 
 5. **Trajectory-level CVaR, not timestep-level**: CVaR is computed
    over C^i = sum(gamma^t * c_t) per rollout. Rationale: captures
@@ -472,16 +502,32 @@ CaRL dependencies, and `pip install -e .` for the PRISM package itself. See
 - Do not add style signals to the safety cost
 - Do not use CaRL's reward function
 - Do not hardcode scaling parameters -- always read from hyperparams.json
-- Do not compute CVaR at timestep level -- always at trajectory level
+- Do not compute the VaR/CVaR *statistic* at timestep level -- `nu` and the
+  logged `CVaR` diagnostic are always estimated from trajectory-level
+  (episode) cumulative costs (`update_var`, `compute_empirical_cvar` in
+  `prism/morl/cvar_penalty.py`). This is separate from the dense
+  per-timestep *signal* `c~_t` fed to the cost critic, which is a reward-
+  shaping construction that telescopes to a trajectory-level quantity, not
+  itself a per-timestep CVaR estimate.
 - Do not reintroduce a Lagrange multiplier / dual update for the safety
   constraint, or a threshold (`epsilon`/`d`) calibrated from the IDM/expert
-  baseline. PRISM's safety objective is an unconstrained penalty
-  (`beta * CVaR_alpha`, fixed `beta`) -- see `CHANGES.md` for why the
-  constrained formulation was replaced.
-- Do not estimate CVaR via a Gaussian closed form
+  baseline. See `CHANGES.md` for why the constrained formulation was
+  replaced (v1) and then why v1's own REINFORCE penalty was replaced in turn
+  (v2).
+- Do not reintroduce a REINFORCE-style term (raw `log_prob` multiplied by a
+  cost weight) for the safety objective. Cost must flow through a cost
+  critic + GAE + PPO's existing clipped-ratio objective, combined with the
+  reward advantage before clipping (`A_total = A_reward - beta*A_cost`) --
+  see the CVaR Safety Penalty section above for why (envelope-theorem
+  violation and missing importance-ratio correction in v1).
+- Do not estimate CVaR/VaR via a Gaussian closed form
   (`mu_C + phi(Phi^-1(alpha))/(1-alpha) * sigma_C`). Always use the
-  empirical/return-capped estimators in `prism/morl/cvar_penalty.py` --
-  the two-tier safety cost distribution is right-skewed.
+  empirical estimators in `prism/morl/cvar_penalty.py` -- the two-tier
+  safety cost distribution is right-skewed.
+- Do not use the sparse hinge difference `(e_{t+1}-nu)^+ - (e_t-nu)^+` for
+  the dense cost signal -- it is exactly zero whenever both `e_t` and
+  `e_{t+1}` are below `nu`. Always use `g_nu`'s smooth softplus hinge
+  (`dense_cost_signal` in `prism/morl/cvar_penalty.py`).
 - Do not add inline comments after values in `lab.env` — GNU Make parses
   `VAR=value   # comment` as the value including trailing spaces and the `#`.
   Put all comments on their own line.

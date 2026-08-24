@@ -382,11 +382,23 @@ class PRISMEnv(EnvironmentWrapper):
         R_t = gamma^{-t} * [f_k(z_{t+1}) - f_k(z_t)]
 
     The safety cost c_t is exposed via info["safety_cost"] but is NOT
-    subtracted from the reward here -- the CVaR penalty is applied in the
-    trainer's actor loss (beta * CVaR_alpha(C^pi)), not per-step in the env.
+    subtracted from the reward here -- the CVaR safety objective is trained
+    via a separate cost critic V^C(s, e_t) in the trainer (see
+    prism/morl/cvar_penalty.py and prism/morl/dpmorl_trainer.py), combined
+    with the reward advantage as A_total = A_reward - beta * A_cost through
+    standard PPO -- not applied per-step in the env.
 
     The observation's value_measurements slot (shape 4) is repurposed to
     carry z_t_normalised so the policy is aware of cumulative style returns.
+
+    A second augmented-state variable, e_t (cumulative discounted safety
+    cost), is tracked identically to z_t and exposed as a NEW observation
+    key "cumulative_cost" (shape (1,), raw/unnormalised -- it is compared
+    directly against the VaR threshold nu in the dense cost signal, so it
+    must stay in the same units as nu, unlike z_t which is EMA-normalised
+    for network input stability). Nothing in this environment's obs dict
+    is validated against a fixed gym.spaces.Dict schema, so adding a new
+    key is safe and requires no changes to CaRL's observation builder.
 
     Parameters
     ----------
@@ -414,6 +426,7 @@ class PRISMEnv(EnvironmentWrapper):
         self._zt_normaliser = zt_normaliser or ZtNormaliser(reward_dim=_REWARD_DIM)
 
         self._zt = np.zeros(_REWARD_DIM, dtype=np.float64)
+        self._et = 0.0
         self._t = 0
 
     # ------------------------------------------------------------------
@@ -430,8 +443,10 @@ class PRISMEnv(EnvironmentWrapper):
     def reset(self, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
         self._zt = np.zeros(_REWARD_DIM, dtype=np.float64)
+        self._et = 0.0
         self._t = 0
         obs["value_measurements"] = self._zt_normaliser.normalise(self._zt)
+        obs["cumulative_cost"] = np.array([self._et], dtype=np.float32)
         return obs, info
 
     def step(self, action):
@@ -445,6 +460,11 @@ class PRISMEnv(EnvironmentWrapper):
         # z_{t+1} = z_t + gamma^t * r_t
         zt_next = self._zt + (self._gamma ** self._t) * np.asarray(r_vec, dtype=np.float64)
 
+        # e_{t+1} = e_t + gamma^t * c_t  -- identical recursion/timing to z_t's
+        # update above.  This exact match is required for the dense cost
+        # signal's telescoping identity to hold (see cvar_penalty.py).
+        et_next = self._et + (self._gamma ** self._t) * c_t
+
         # DPMORL scalar reward: R_t = gamma^{-t} * [f(z_{t+1}) - f(z_t)]
         f_next = float(self._utility_fn(zt_next))
         f_curr = float(self._utility_fn(self._zt))
@@ -452,18 +472,23 @@ class PRISMEnv(EnvironmentWrapper):
 
         # Update cumulative state
         self._zt = zt_next
+        self._et = et_next
         self._t += 1
 
         # Update normaliser at episode end
         if termination or truncation:
             self._zt_normaliser.update(self._zt)
 
-        # Augment observation with normalised z_t (4 values)
+        # Augment observation with normalised z_t (4 values) and raw e_t (1 value).
+        # e_t stays unnormalised: the dense cost signal compares it directly
+        # against the VaR threshold nu, so it must remain in raw cost units.
         obs["value_measurements"] = self._zt_normaliser.normalise(self._zt)
+        obs["cumulative_cost"] = np.array([self._et], dtype=np.float32)
 
-        # Expose episode z_T for CVaR computation
+        # Expose episode z_T / e_T for CVaR and Pareto-front logging
         if termination or truncation:
             info["episode_zt"] = self._zt.copy()
+        info["cumulative_cost"] = self._et
 
         return obs, R_t, termination, truncation, info
 
