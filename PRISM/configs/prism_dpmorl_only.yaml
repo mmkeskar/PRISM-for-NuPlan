@@ -20,12 +20,20 @@
 #
 # Success is judged from the new z_comfort/z_progress/z_lateral/z_spacing
 # fields in policy_{k}_metrics.jsonl (mean z_T per style dimension, per
-# update) -- compare the 4 policies' trends against each other; each should
+# update) -- compare the K policies' trends against each other; each should
 # trend higher on ITS OWN preferred dimension than the others do.
 #
-# Otherwise identical to prism_default.yaml (K=4, same as the
-# instability-analysis experiment, for full style-dimension coverage and
-# faster sequential wall-clock).
+# K reduced 4 -> 2 for this run (less training before getting a first
+# signal): policy 0 = comfort-preferring, policy 1 = progress-preferring
+# (from scripts/train.py's _get_preference_vectors() generic fallback for
+# n_policies != 5, which for K=2 lands on dims 0/1 -- two clearly
+# contrasting, behaviorally distinct styles). If these two diverge cleanly,
+# scale back up to K=4 (n_policies: 4 here, no other change needed) for
+# full coverage before the warm-start/safety-combination step.
+#
+# Also includes the log_std clamp fix (prism/models/common/action_heads.py)
+# from the previous run's real finding: entropy climbed monotonically for
+# 1600+ updates with flat reward, traced to log_std having no upper bound.
 
 # ── Experiment ───────────────────────────────────────────────────────────────
 experiment_name: prism_dpmorl_only_001
@@ -38,7 +46,7 @@ cache_path: /data/prism_cache
 log_names: []
 
 # ── PRISM MORL ───────────────────────────────────────────────────────────────
-n_policies: 4
+n_policies: 2
 reward_dim: 4
 gamma: 0.99
 

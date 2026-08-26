@@ -751,3 +751,80 @@ script instead.
       `scripts/analyze_metrics.py runs/dpmorl_only/policy_*_metrics.jsonl` to read the
       result instead of manual analysis.
 - [ ] Everything else from the prior entry's Outstanding section still applies unchanged.
+
+---
+
+## 2026-08-26 — Unbounded log_std fix, K reduced to 2 for the next DPMORL-only run
+
+### Motivation
+
+First real DPMORL-only run (1605 updates, K=4, beta=0/cf_coef=0): `mean_reward_this_update`
+stayed completely flat (0.031-0.034) the entire run -- no improvement at all -- while
+`entropy` climbed monotonically from 1.98 to 3.74 and never turned around, and
+`approx_kl` was enormous in the first 3 bins (11.3, 10.6, 23.8 -- healthy PPO updates are
+normally ~0.001-0.05). Traced the mechanism: `StochasticActionHead.log_std`
+(`prism/models/common/action_heads.py`) had no upper bound. The PPO surrogate loss's
+gradient contribution to `log_std` is structurally close to zero (per-minibatch advantage
+normalization + ratio~1 make it near-self-cancelling -- the same effect already documented
+for `reward_loss`/`cost_penalty`, and now understood to extend to `ppo_loss` itself), while
+the entropy bonus (`-ent_coef * entropy` in `total_loss`) provides a constant, unopposed
+pull toward higher entropy. With nothing capping `log_std`, action noise could grow for the
+entire run instead of shrinking as the policy commits to learned behavior -- and growing
+noise plausibly explains the flat reward directly: the network's learned mean action gets
+increasingly drowned out by its own randomness. This is architecture-level code, shared by
+both experiments (not personalization- or safety-specific), so it's also a plausible
+contributor to the burst of short/crash-like episodes seen in the safety-cost
+(instability-analysis) run's updates ~1300-3260 -- not confirmed directly (that run predates
+entropy logging and was never restarted), but a consistent, plausible mechanism.
+
+### Changes
+
+**1. `log_std` clamp** (`prism/models/common/action_heads.py`) -- new module constants
+   `_LOG_STD_MIN = -5.0`, `_LOG_STD_MAX = 1.0` (std range ~[0.007, 2.72], chosen for actions
+   normalised to [-1, 1] per the existing docstring; wide enough not to artificially
+   constrain exploration, bounded enough that noise can't grow without limit). Applied via
+   `.clamp()` on a computed copy inside `forward()`, not in-place on the stored
+   `nn.Parameter` -- stays differentiable, doesn't fight the optimizer's own momentum
+   state. The raw parameter can still drift outside the range under gradient descent (seen
+   directly in a stress test: forced to 50.0, stayed at 50.0 after further training) but its
+   EFFECT is always bounded, since every forward pass re-clamps before computing the
+   distribution.
+
+**2. `tests/test_action_heads.py`** (new) -- direct unit tests on `StochasticActionHead`:
+   forcing `log_std` to 100 confirms entropy reflects the clamped ceiling, not the raw
+   value; forcing it to -100 confirms `log_prob` stays finite (an uncapped floor would
+   collapse std toward 0 and blow up log-probability for any off-mean action); a value
+   already inside the range passes through unchanged; and a sanity check that the default
+   `init_log_std=-0.5` falls strictly inside the clamp bounds.
+
+**3. K reduced 4 → 2 for the next DPMORL-only run** (`configs/prism_dpmorl_only.yaml`,
+   Makefile echo text updated to match) -- less training before getting a first signal on
+   whether personalization works at all. Uses `_get_preference_vectors()`'s existing
+   generic fallback for `n_policies != 5` (no new code needed): for K=2 this lands on
+   policy 0 = comfort-preferring, policy 1 = progress-preferring -- two clearly contrasting,
+   behaviorally distinct styles. If these two diverge cleanly once the log_std fix is in,
+   scale back to `n_policies: 4` for full coverage before the warm-start/safety-combination
+   step from the earlier plan.
+
+### Verification
+
+- `python -m pytest tests/` -- 48/48 passing (44 existing + 4 new).
+- Stress-test smoke run: `log_std` force-set to 50.0 before training; confirmed training
+  completes without crashing and the EFFECTIVE (clamped) log_std used in the action
+  distribution is correctly bounded at 1.0 regardless of the raw parameter's value.
+- `configs/prism_dpmorl_only.yaml` confirmed parses with `n_policies: 2`;
+  `make -n train-dpmorl-only-mini` dry-run confirmed correct.
+
+### Outstanding
+
+- [ ] Run `make train-dpmorl-only-mini` (K=2, log_std fix in place) and check with
+      `scripts/analyze_metrics.py`: does entropy now trend down (or at least plateau)
+      instead of climbing unboundedly, and does reward show any improvement this time?
+- [ ] If yes to both: scale back to K=4, then proceed to the warm-start/safety-combination
+      step from the earlier plan.
+- [ ] If entropy is fixed but reward is still flat: the log_std runaway wasn't the (only)
+      cause -- investigate the reward signal/critic more directly.
+- [ ] Consider whether to apply the same stress-test style check retroactively once the
+      instability-analysis (safety-cost) run is restarted with current code, to see whether
+      entropy behaves the same way there and whether it correlates with the
+      updates-1300-3260 episode-termination burst as hypothesized above.

@@ -37,9 +37,10 @@ What it reports, per run:
 When multiple files are given, also prints a cross-policy z_T comparison
 (mean z_T per style dimension, early vs late) to check whether each policy
 is trending higher on its own preferred dimension than the others --
-assumes the standard K=4 ordering (policy 0=comfort, 1=progress,
-2=lateral, 3=spacing) from scripts/train.py's _get_preference_vectors();
-if your run used a different K or preference assignment, read the raw
+assumes the standard preference ordering (policy 0=comfort, 1=progress,
+2=lateral, 3=spacing, for whatever K <= 4 was used) from scripts/train.py's
+_get_preference_vectors(); if your run used a different K or preference
+assignment, read the raw
 z_comfort/z_progress/z_lateral/z_spacing columns yourself instead of
 trusting the "own dimension" highlighting.
 """
@@ -229,7 +230,7 @@ def report_run(label, cfg, ups, n_bins=10):
 def report_cross_policy(labeled_runs):
     if len(labeled_runs) < 2:
         return
-    print(f"\n{'='*78}\nCross-policy z_T comparison (assumes standard K=4 ordering: "
+    print(f"\n{'='*78}\nCross-policy z_T comparison (assumes standard ordering: "
           f"0=comfort,1=progress,2=lateral,3=spacing)\n{'='*78}")
     have_z = [(label, r) for label, r in labeled_runs if r and any("z_comfort" in u for u in r["ups"])]
     if not have_z:

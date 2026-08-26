@@ -211,7 +211,7 @@ train-instability-mini:
 # ─────────────────────────────────────────────────────────────────────────────
 
 train-dpmorl-only-mini:
-	@echo "── DPMORL-only experiment (beta=0, cf_coef=0, mini dataset, K=4) ──"
+	@echo "── DPMORL-only experiment (beta=0, cf_coef=0, mini dataset, K=2) ──"
 	$(PYTHON) scripts/train.py \
 	    --config     configs/prism_dpmorl_only.yaml \
 	    --hyperparams hyperparams.json \

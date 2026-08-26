@@ -10,6 +10,24 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
+# log_std is clamped to this range before use (see forward()). Nothing
+# previously bounded it: the PPO surrogate loss's gradient contribution
+# to log_std is structurally close to zero (per-minibatch advantage
+# normalization + ratio~1 make it near-self-cancelling), while the
+# entropy bonus (-ent_coef * entropy in the total loss) provides a
+# constant, unopposed pull toward HIGHER entropy. With no ceiling, that
+# pull can make log_std -- and therefore action noise -- drift upward
+# for the entire run instead of shrinking as the policy commits to
+# learned behavior (observed directly: entropy climbing monotonically
+# over 1600+ updates in a real run, alongside flat reward -- the actor
+# was implicated once the growing-noise mechanism was traced through).
+# Range chosen for actions normalised to [-1, 1] (see init_log_std's
+# docstring below): std in ~[0.007, 2.72] -- wide enough to not
+# artificially constrain useful exploration, bounded enough that noise
+# can't grow without limit.
+_LOG_STD_MIN = -5.0
+_LOG_STD_MAX = 1.0
+
 
 class StochasticActionHead(nn.Module):
     """
@@ -22,7 +40,10 @@ class StochasticActionHead(nn.Module):
       - log_prob()    for the clipped probability ratio during updates
 
     The log_std parameters are the only learnable weights here; they are
-    initialised to init_log_std across all dimensions.
+    initialised to init_log_std across all dimensions, and CLAMPED to
+    [_LOG_STD_MIN, _LOG_STD_MAX] on every forward pass (not in-place on
+    the stored parameter -- the clamp is applied to a computed copy, so
+    it stays differentiable and doesn't fight the optimizer's own state).
 
     Args:
         action_dim:   number of action dimensions (e.g. 2 for accel + steer)
@@ -51,7 +72,8 @@ class StochasticActionHead(nn.Module):
               log_prob: (batch,)  — summed over action dimensions
               entropy:  (batch,)  — summed over action dimensions
         """
-        std = self.log_std.exp().expand_as(mean)
+        log_std = self.log_std.clamp(_LOG_STD_MIN, _LOG_STD_MAX)
+        std = log_std.exp().expand_as(mean)
         dist = Normal(mean, std)
 
         if actions is None:
