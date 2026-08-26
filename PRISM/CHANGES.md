@@ -540,3 +540,23 @@ below and nothing else.
 - [ ] Reward-only (`beta=0`, `cf_coef=0`) and cost-only (`reward_weight=0`, `beta=1`)
       ablations remain deferred, not part of this experiment — would need a new
       symmetric `reward_weight` config knob (not yet implemented).
+
+### Addendum — K reduced 5 → 4
+
+Cuts sequential wall-clock by 20% (K trainers run sequentially per
+`scripts/train.py`'s docstring). `_get_preference_vectors()` gained an explicit
+`n_policies == 4` case — the existing K=5 curated list minus "balanced" — rather than
+falling through to the generic per-K formula, which for K=4 produces a less extreme
+skew (~42/19/19/19 vs. the curated 55/15/15/15) and for K=3 specifically never
+emphasizes one of the 4 reward dimensions at all (`k % reward_dim` never reaches it
+within 3 iterations). K=4 was chosen over K=3 specifically to keep full coverage across
+all 4 style dimensions — relevant here since instability could be style-dependent (e.g.
+a progress-weighted policy driving more aggressively than a comfort-weighted one).
+
+Also fixed a latent bug this surfaced: `make train-instability-mini`'s Makefile target
+had copied `--n_policies 2` from `train-mini` (whose job is a fast pipeline smoke test,
+not a substantive run) — since CLI `--n_policies` overrides the config file's
+`n_policies` (`scripts/train.py`: `if args.n_policies: cfg["n_policies"] = args.n_policies`),
+this would have silently run K=2 regardless of what `prism_instability_experiment.yaml`
+specified. Removed the CLI override; `n_policies: 4` in the YAML is now the sole source
+of truth for this target.

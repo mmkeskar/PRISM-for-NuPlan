@@ -191,15 +191,18 @@ train-mini:
 # Training — instability-analysis experiment (mini smoke test)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# n_policies is intentionally NOT passed as --n_policies here (unlike
+# train-mini's --n_policies 2, which caps K for a quick pipeline smoke test):
+# this is a real diagnostic run, not a smoke test, so K=4 from
+# prism_instability_experiment.yaml is the source of truth.
 train-instability-mini:
-	@echo "── Instability-analysis experiment (indicator-only TTC cost, mini dataset) ──"
+	@echo "── Instability-analysis experiment (indicator-only TTC cost, mini dataset, K=4) ──"
 	$(PYTHON) scripts/train.py \
 	    --config     configs/prism_instability_experiment.yaml \
 	    --hyperparams hyperparams.json \
 	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
 	    --cache_path  $(MINI_CACHE_PATH) \
-	    --output_dir  runs/instability_ttc \
-	    --n_policies  2
+	    --output_dir  runs/instability_ttc
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training — full run

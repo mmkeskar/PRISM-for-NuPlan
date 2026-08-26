@@ -221,6 +221,19 @@ def _get_preference_vectors(n_policies: int, reward_dim: int) -> list:
             [0.15, 0.15, 0.15, 0.55],  # spacing
             [0.25, 0.25, 0.25, 0.25],  # balanced
         ]
+    if n_policies == 4 and reward_dim == 4:
+        # The 5-policy list above minus "balanced" -- keeps all 4 style
+        # extremes (full reward-dimension coverage) rather than falling
+        # through to the generic formula below, which for n_policies=4
+        # produces a less extreme skew (~42/19/19/19 vs 55/15/15/15) and
+        # for n_policies=3 specifically never emphasizes one dimension at
+        # all (k % reward_dim never reaches it).
+        return [
+            [0.55, 0.15, 0.15, 0.15],  # comfort
+            [0.15, 0.55, 0.15, 0.15],  # progress
+            [0.15, 0.15, 0.55, 0.15],  # lateral discipline
+            [0.15, 0.15, 0.15, 0.55],  # spacing
+        ]
     base = 1.0 / reward_dim
     vecs = []
     for k in range(n_policies):

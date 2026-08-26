@@ -43,7 +43,11 @@ cache_path: /data/prism_cache
 log_names: []
 
 # ── PRISM MORL ───────────────────────────────────────────────────────────────
-n_policies: 5
+# K reduced from 5 -> 4 for this experiment (cuts sequential wall-clock by
+# 20%): drops the "balanced" preference vector, keeps the 4 single-dimension
+# extremes (comfort/progress/lateral/spacing) for full reward-dimension
+# coverage -- see _get_preference_vectors() in scripts/train.py.
+n_policies: 4
 reward_dim: 4
 gamma: 0.99
 
