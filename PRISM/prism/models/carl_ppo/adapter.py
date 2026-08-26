@@ -271,3 +271,6 @@ class CaRLPPOAdapter(PRISMPolicyBase):
         # CVaR cost critic (v2) — separate weights, style-independent
         params += list(self.cost_value_head.parameters())
         return iter(params)
+
+    def cost_critic_parameters(self) -> Iterator[nn.Parameter]:
+        return iter(list(self.cost_value_head.parameters()))

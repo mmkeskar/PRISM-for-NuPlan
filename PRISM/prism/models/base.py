@@ -69,6 +69,17 @@ class PRISMPolicyBase(nn.Module, ABC):
         """
         return (p for p in self.parameters() if p.requires_grad)
 
+    def cost_critic_parameters(self) -> Iterator[nn.Parameter]:
+        """
+        Parameters belonging ONLY to the cost critic head, a subset of
+        trainable_parameters(). Used by the trainer to split the combined
+        loss's gradient norm into cost-critic vs. rest, before the shared
+        grad-norm clip -- a diagnostic for whether the cost critic's
+        (potentially spiky) regression loss is dominating the shared clip.
+        Default: empty (no cost critic). Override in adapters that have one.
+        """
+        return iter(())
+
 
 class PRISMCriticBase(nn.Module, ABC):
     """

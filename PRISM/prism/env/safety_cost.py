@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -68,7 +68,12 @@ class SafetyCostBuilder:
     Call reset() at the start of each episode, then compute() at each step.
     """
 
-    def __init__(self, hp: Dict) -> None:
+    def __init__(
+        self,
+        hp: Dict,
+        outcome_costs_enabled: bool = True,
+        active_indicators: Optional[Sequence[str]] = None,
+    ) -> None:
         self._hp = hp
         self._ind_weights: Dict[str, float] = hp.get("indicator_weights", {})
         self._ind_caps: Dict[str, float] = hp.get("indicator_caps", {})
@@ -77,9 +82,21 @@ class SafetyCostBuilder:
             "ttc_threshold_s": 1.5,
             "thw_threshold_s": 2.0,
         })
+        # Ablation switches (instability-analysis experiments). Event/
+        # indicator flags are always set for logging regardless of these --
+        # only the c_t CONTRIBUTION is withheld -- so infraction telemetry
+        # stays complete even when a component is excluded from cost.
+        self._outcome_costs_enabled = outcome_costs_enabled
+        # None = all indicators contribute (unchanged default behavior).
+        self._active_indicators = (
+            set(active_indicators) if active_indicators is not None else None
+        )
         # Episode accumulators for cap enforcement
         self._acc: Dict[str, float] = {}
         self.reset()
+
+    def _indicator_enabled(self, name: str) -> bool:
+        return self._active_indicators is None or name in self._active_indicators
 
     def reset(self) -> None:
         self._acc = {ind: 0.0 for ind in self._ind_weights}
@@ -106,54 +123,69 @@ class SafetyCostBuilder:
         comp = SafetyCostComponents()
 
         # ── Tier 1: outcome events ──────────────────────────────────────
+        # Flags are set unconditionally (diagnostics/infraction logging must
+        # stay accurate); c_outcome is only accumulated when the ablation
+        # switch is on -- see __init__.
         if had_vru_collision:
-            comp.c_outcome += self._out_weights.get("vru_collision", 100)
+            if self._outcome_costs_enabled:
+                comp.c_outcome += self._out_weights.get("vru_collision", 100)
             comp.vru_collision = True
         elif had_collision:
-            comp.c_outcome += self._out_weights.get("vehicle_collision", 80)
+            if self._outcome_costs_enabled:
+                comp.c_outcome += self._out_weights.get("vehicle_collision", 80)
             comp.vehicle_collision = True
 
         if had_wrong_direction:
-            comp.c_outcome += self._out_weights.get("wrong_direction", 100)
+            if self._outcome_costs_enabled:
+                comp.c_outcome += self._out_weights.get("wrong_direction", 100)
             comp.wrong_direction = True
 
         if ran_red_light:
-            comp.c_outcome += self._out_weights.get("red_light_violation", 80)
+            if self._outcome_costs_enabled:
+                comp.c_outcome += self._out_weights.get("red_light_violation", 80)
             comp.red_light = True
 
         if is_off_road:
-            comp.c_outcome += self._out_weights.get("drivable_area", 65)
+            if self._outcome_costs_enabled:
+                comp.c_outcome += self._out_weights.get("drivable_area", 65)
             comp.off_road = True
 
         # ── Tier 2: indicator signals ──────────────────────────────────
+        # Same pattern: flags always set, contribution gated by
+        # _indicator_enabled() (default: all indicators contribute).
         v_ego = ego_state.dynamic_car_state.speed
 
         # TTC indicator
         ttc = self._ttc(v_ego, v_lead, d_lead, has_lead)
         if ttc < self._thresholds.get("ttc_threshold_s", 1.5):
             comp.ttc_active = True
-            comp.c_lead += self._cap_indicator("ttc")
+            if self._indicator_enabled("ttc"):
+                comp.c_lead += self._cap_indicator("ttc")
 
         # THW indicator
         thw = self._thw(v_ego, d_lead, has_lead)
         if thw < self._thresholds.get("thw_threshold_s", 2.0):
             comp.thw_active = True
-            comp.c_lead += self._cap_indicator("thw")
+            if self._indicator_enabled("thw"):
+                comp.c_lead += self._cap_indicator("thw")
 
         # Speed violation indicator
         if v_limit is not None and v_limit > 0 and v_ego > v_limit:
             comp.speed_active = True
-            comp.c_lead += self._cap_indicator("speed")
+            if self._indicator_enabled("speed"):
+                comp.c_lead += self._cap_indicator("speed")
 
         # Blind spot occupancy indicator
         if self._blind_spot_occupied(ego_state, detection_cache):
             comp.blind_spot_active = True
-            comp.c_lead += self._cap_indicator("blind_spot")
+            if self._indicator_enabled("blind_spot"):
+                comp.c_lead += self._cap_indicator("blind_spot")
 
         # Red light ahead indicator (ego is approaching a red connector)
         if self._red_light_ahead(ego_state, map_cache):
             comp.red_light_ahead_active = True
-            comp.c_lead += self._cap_indicator("red_light")
+            if self._indicator_enabled("red_light"):
+                comp.c_lead += self._cap_indicator("red_light")
 
         return comp
 

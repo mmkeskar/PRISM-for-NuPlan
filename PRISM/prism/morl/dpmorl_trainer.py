@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
@@ -68,6 +69,8 @@ from prism.morl.cvar_penalty import (
     update_var,
 )
 from prism.morl.utility_functions import UtilityFunction
+from prism.utils.gpu_monitor import GPUMonitor
+from prism.utils.metrics_logger import MetricsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +137,18 @@ class DPMORLTrainer:
         Training config (from prism_default.yaml).  Reads `beta` (fixed
         combined-advantage penalty weight), `tau` (cost-hinge smoothness),
         `cf_coef` (cost critic loss coefficient), and `cvar_buffer_size`
-        (rolling episode-cost window for the VaR/nu estimate).
+        (rolling episode-cost window for the VaR/nu estimate). Also reads
+        `fixed_alpha` (instability-analysis ablation: constant alpha for
+        the whole run, bypassing alpha_start/alpha_end/n_curriculum_iters
+        entirely, when set) and `gpu_log_interval_s` (GPUMonitor sample
+        interval, default 2.0s). The env-level ablation toggles
+        (`outcome_costs_enabled`, `active_indicators`, `cost_scale`) are
+        consumed in scripts/train.py's _build_env(), not here -- they're
+        only echoed into this trainer's metrics-log config record for
+        self-describing output files.
     output_dir : Path
-        Where to save checkpoints.
+        Where to save checkpoints and verbose per-update metrics
+        (policy_{id}_metrics.jsonl, policy_{id}_gpu.jsonl).
     device : torch.device
     """
 
@@ -167,6 +179,10 @@ class DPMORLTrainer:
             alpha_end=cfg.get("alpha_end", 0.95),
             n_curriculum=cfg.get("n_curriculum_iters", 5000),
         )
+        # Instability-analysis ablation: bypass the curriculum entirely and
+        # use a single constant alpha for the whole run when set. None (the
+        # default) preserves the original curriculum behavior.
+        self._fixed_alpha = cfg.get("fixed_alpha", None)
         self._cost_buffer = EpisodeCostBuffer(
             buffer_size=cfg.get("cvar_buffer_size", 500)
         )
@@ -182,6 +198,40 @@ class DPMORLTrainer:
         # Consecutive updates containing a NaN/Inf in c~_t, A_t^C, or
         # total_loss. Training halts once this reaches _NAN_HALT_STREAK.
         self._nan_streak = 0
+
+        # ── Verbose per-update metrics + GPU utilization logging ─────────
+        # Written for every update (not just every 100th, unlike the INFO
+        # log line below) so a full run can be analyzed offline in pandas
+        # without depending on terminal scrollback.
+        self._metrics = MetricsLogger(
+            self.output_dir / f"policy_{policy_id}_metrics.jsonl"
+        )
+        gpu_index = device.index if device.type == "cuda" and device.index is not None else 0
+        self._gpu_monitor = GPUMonitor(
+            device_index=gpu_index,
+            interval_s=cfg.get("gpu_log_interval_s", 2.0),
+            log_path=self.output_dir / f"policy_{policy_id}_gpu.jsonl",
+        )
+        self._metrics.log_config({
+            "policy_id": policy_id,
+            "beta": self._beta, "tau": self._tau,
+            "cf_coef": cfg.get("cf_coef", 0.5), "vf_coef": cfg.get("vf_coef", 0.5),
+            "ent_coef": cfg.get("ent_coef", 0.01), "clip_coef": cfg.get("clip_coef", 0.2),
+            "gamma": cfg.get("gamma", 0.99), "gae_lambda": cfg.get("gae_lambda", 0.95),
+            "max_grad_norm": cfg.get("max_grad_norm", 0.5),
+            "update_epochs": cfg.get("update_epochs", 4),
+            "minibatch_size": cfg.get("minibatch_size", 64),
+            "cvar_buffer_size": cfg.get("cvar_buffer_size", 500),
+            "alpha_start": cfg.get("alpha_start", 0.20), "alpha_end": cfg.get("alpha_end", 0.95),
+            "n_curriculum_iters": cfg.get("n_curriculum_iters", 5000),
+            "fixed_alpha": self._fixed_alpha,
+            # Ablation toggles live in the env/safety-cost stack, echoed here
+            # (from cfg, where scripts/train.py also reads them) so this
+            # file is self-describing without also needing the run's YAML.
+            "outcome_costs_enabled": cfg.get("outcome_costs_enabled", True),
+            "active_indicators": cfg.get("active_indicators", None),
+            "cost_scale": cfg.get("cost_scale", 1.0),
+        })
 
         # Set env utility function (no lambda -- PRISMEnv returns raw R_t)
         self.env.set_utility_fn(utility_fn.as_callable())
@@ -210,14 +260,31 @@ class DPMORLTrainer:
         next_obs = {k: torch.from_numpy(np.array(v)).unsqueeze(0).to(self.device)
                     for k, v in obs.items()}
 
+        self._gpu_monitor.start()
+        try:
+            self._train_loop(n_updates, steps_per_update, next_obs, summary)
+        finally:
+            self._gpu_monitor.stop()
+            self._metrics.close()
+
+        self._save_checkpoint(n_updates - 1, final=True)
+        return summary
+
+    def _train_loop(self, n_updates: int, steps_per_update: int, next_obs, summary: Dict) -> None:
         for update in range(n_updates):
+            update_start = time.time()
+
             # Guard: alpha must never reach 1.0 (defense-in-depth -- neither
             # update_var nor compute_empirical_cvar currently divides by
             # (1-alpha), but this matches the spec's explicit guard and
             # protects any future code that might).
-            alpha = min(self.alpha_schedule.get(update), 0.999)
+            if self._fixed_alpha is not None:
+                alpha = min(self._fixed_alpha, 0.999)
+            else:
+                alpha = min(self.alpha_schedule.get(update), 0.999)
 
             # ── Rollout collection ─────────────────────────────────────
+            rollout_start = time.time()
             self._buffer.clear()
             episode_step_costs: List[float] = []
             local_episode_costs: List[float] = []
@@ -274,6 +341,8 @@ class DPMORLTrainer:
                         for k, v in next_obs_raw.items()
                     }
 
+            rollout_end = time.time()
+
             # ── VaR / CVaR diagnostics + dense cost signal ──────────────
             buffer_costs = self._cost_buffer.costs
             mu_c = float(np.mean(buffer_costs)) if buffer_costs else 0.0
@@ -313,7 +382,9 @@ class DPMORLTrainer:
             )
 
             # ── PPO update ─────────────────────────────────────────────
+            ppo_start = time.time()
             loss_info = self._ppo_update(next_obs, dense_costs)
+            ppo_end = time.time()
 
             # A2 -- NaN/Inf halt check. c~_t (dense_nan, above), A_t^C, and
             # total_loss (both inside loss_info, from _ppo_update) each log
@@ -330,6 +401,41 @@ class DPMORLTrainer:
                 self._nan_streak += 1
             else:
                 self._nan_streak = 0
+
+            # ── Verbose per-update metrics (every update, not just every 100th) ──
+            gpu_stats = self._gpu_monitor.average_window(update_start) or {}
+            self._metrics.log_update({
+                "update": update + 1,
+                "policy_id": self.policy_id,
+                "global_step": self._global_step,
+                "alpha": alpha,
+                "var_nu": nu,
+                "cvar_hat": cvar_hat,
+                "mu_c": mu_c,
+                "sigma_c": sigma_c,
+                "n_episodes_this_update": len(local_episode_costs),
+                "mean_episode_cost_this_update": (
+                    float(np.mean(local_episode_costs)) if local_episode_costs else None
+                ),
+                "std_episode_cost_this_update": (
+                    float(np.std(local_episode_costs)) if local_episode_costs else None
+                ),
+                "reward_loss": loss_info["reward_loss"],
+                "cost_penalty": loss_info["cost_penalty"],
+                "cost_critic_loss": loss_info["cost_critic_loss"],
+                "total_loss": loss_info["total_loss"],
+                "grad_norm_total_preclip": loss_info["grad_norm_total_preclip"],
+                "grad_norm_cost_critic": loss_info["grad_norm_cost_critic"],
+                "grad_norm_other": loss_info["grad_norm_other"],
+                "dense_cost_nan": dense_nan,
+                "nan_detected": loss_info["nan_detected"],
+                "nan_streak": self._nan_streak,
+                "zero_cost_streak": self._zero_cost_streak,
+                "rollout_time_s": rollout_end - rollout_start,
+                "ppo_update_time_s": ppo_end - ppo_start,
+                "update_total_time_s": time.time() - update_start,
+                **gpu_stats,
+            })
 
             if self._nan_streak >= _NAN_HALT_STREAK:
                 logger.error(
@@ -367,9 +473,6 @@ class DPMORLTrainer:
 
             if (update + 1) % self.cfg.get("save_every", 500) == 0:
                 self._save_checkpoint(update)
-
-        self._save_checkpoint(n_updates - 1, final=True)
-        return summary
 
     # ------------------------------------------------------------------
     # Dense cost signal
@@ -481,6 +584,9 @@ class DPMORLTrainer:
                 "reward_loss": 0.0, "cost_penalty": 0.0,
                 "cost_critic_loss": 0.0, "total_loss": 0.0,
                 "nan_detected": False,
+                "grad_norm_total_preclip": 0.0,
+                "grad_norm_cost_critic": 0.0,
+                "grad_norm_other": 0.0,
             }
 
         rewards = np.array(self._buffer.rewards, dtype=np.float32)
@@ -540,10 +646,19 @@ class DPMORLTrainer:
         b_returns = torch.from_numpy(returns).to(self.device)
         b_cost_returns = torch.from_numpy(cost_returns).to(self.device)
 
+        # Cost-critic parameter set, fixed for the whole update -- used to
+        # split each minibatch's gradient norm into cost-critic vs. rest
+        # (see below). Empty for backbones without a cost critic.
+        cost_critic_params = list(self.agent.cost_critic_parameters())
+        cost_critic_param_ids = {id(p) for p in cost_critic_params}
+
         epoch_reward_loss = 0.0
         epoch_cost_penalty = 0.0
         epoch_cost_critic_loss = 0.0
         epoch_total_loss = 0.0
+        epoch_grad_norm_total = 0.0
+        epoch_grad_norm_cost_critic = 0.0
+        epoch_grad_norm_other = 0.0
         n_minibatches = 0
 
         for _ in range(update_epochs):
@@ -589,6 +704,9 @@ class DPMORLTrainer:
                 # corrupt every weight in the network) but keep processing
                 # the rest of this update -- the halt decision is made at
                 # update granularity in train(), not on the first occurrence.
+                mb_grad_norm_total = 0.0
+                mb_grad_norm_cost_critic = 0.0
+                mb_grad_norm_other = 0.0
                 if not torch.isfinite(total_loss):
                     nan_detected = True
                     logger.error(
@@ -602,9 +720,29 @@ class DPMORLTrainer:
                 else:
                     self.optimizer.zero_grad()
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.agent.trainable_parameters()), max_grad_norm
+
+                    # Diagnostic: gradient norm split by parameter group,
+                    # computed BEFORE clipping (clip_grad_norm_ below rescales
+                    # .grad in place) -- directly measures whether the cost
+                    # critic's (potentially spiky) gradients dominate the
+                    # shared clip, one of the hypothesized instability drivers.
+                    all_params = list(self.agent.trainable_parameters())
+                    cc_sq = other_sq = 0.0
+                    for p in all_params:
+                        if p.grad is None:
+                            continue
+                        sq = float(p.grad.detach().pow(2).sum().item())
+                        if id(p) in cost_critic_param_ids:
+                            cc_sq += sq
+                        else:
+                            other_sq += sq
+                    mb_grad_norm_cost_critic = cc_sq ** 0.5
+                    mb_grad_norm_other = other_sq ** 0.5
+
+                    grad_norm_total_t = torch.nn.utils.clip_grad_norm_(
+                        all_params, max_grad_norm
                     )
+                    mb_grad_norm_total = float(grad_norm_total_t.item())
                     self.optimizer.step()
 
                 # Diagnostics only (unclipped surrogate magnitudes -- see docstring)
@@ -616,6 +754,9 @@ class DPMORLTrainer:
                 epoch_cost_penalty += float(cost_penalty_diag.item())
                 epoch_cost_critic_loss += float(cost_critic_loss.item())
                 epoch_total_loss += float(total_loss.item())
+                epoch_grad_norm_total += mb_grad_norm_total
+                epoch_grad_norm_cost_critic += mb_grad_norm_cost_critic
+                epoch_grad_norm_other += mb_grad_norm_other
                 n_minibatches += 1
 
         return {
@@ -624,6 +765,9 @@ class DPMORLTrainer:
             "cost_critic_loss": epoch_cost_critic_loss / max(n_minibatches, 1),
             "total_loss": epoch_total_loss / max(n_minibatches, 1),
             "nan_detected": nan_detected,
+            "grad_norm_total_preclip": epoch_grad_norm_total / max(n_minibatches, 1),
+            "grad_norm_cost_critic": epoch_grad_norm_cost_critic / max(n_minibatches, 1),
+            "grad_norm_other": epoch_grad_norm_other / max(n_minibatches, 1),
         }
 
     # ------------------------------------------------------------------

@@ -364,3 +364,179 @@ Per the request's implementation checklist (§8):
 - [x] Unit tests updated and passing (`tests/test_rewards.py`) — pure
       Python/numpy, no nuPlan/gym dependency, run with
       `python -m pytest tests/test_rewards.py -v`.
+
+---
+
+## 2026-08-25 — Instability-analysis experiment: indicator-only cost, ablation toggles, verbose logging (branch `instability-analysis`)
+
+### Motivation
+
+A real `make train-mini` run on the lab GPU server (8800 updates, CaRL backbone, full
+CVaR v2 pipeline from the 2026-08-23 entry above) showed sustained, unrecovered
+instability: `cost_critic_loss` exploding into the tens of thousands, `var_nu` growing
+~30x and never settling, `sigma_c` staying flat while `var_nu` climbed (a heavy-tail
+signature). Root-cause discussion (see conversation log, not reproduced here) converged
+on two leading hypotheses, ranked by evidence strength:
+
+1. **Cost formulation** — Tier-1 outcome costs (`prism/env/safety_cost.py`) are applied
+   as single-timestep lumps of 65-100 (and can stack past 200, since `wrong_direction`/
+   `red_light`/`off_road` are independent `if` blocks, not mutually exclusive). The dense
+   cost signal `c~_t = gamma^{-t}[g_nu(e_{t+1}) - g_nu(e_t)]` depends on the PER-STEP
+   INCREMENT, not the episode total — a hand-derived toy example reproduced the exact
+   >99% loss-domination signature seen in the real logs when a single large increment
+   hits late in an episode (`gamma^{-t}` up to ~4.5x at t=149, squared in the critic
+   loss). Tier-2 indicator costs are structurally different: `_cap_indicator()` caps each
+   indicator's PER-STEP contribution at its `ind_weight` (~2-7) regardless of remaining
+   cap headroom, so even worst-case simultaneous multi-indicator firing bounds the
+   per-step increment an order of magnitude below a single outcome lump.
+2. **`nu` as a moving target** — `nu = quantile(episode_cost_buffer, alpha)` is
+   recomputed every update from BOTH a climbing `alpha` curriculum (0.20 -> 0.95 over
+   5000 iterations) AND a rolling buffer that mixes old/current-policy episodes —
+   directly analogous to the DQN "moving target" problem (target networks / soft updates
+   are the standard fix). Random CaRL initialization was also discussed but ranked below
+   both of the above: it plausibly amplifies the SEVERITY of the earliest instability
+   trigger, but by update 5000-8800 (thousands of gradient steps later) it is a weak
+   direct explanation for behavior that persists that long.
+
+This experiment isolates both hypotheses in one run rather than three, by comparing
+against the existing 8800-update full-cost run as a baseline with exactly the changes
+below and nothing else.
+
+### Changes
+
+**1. `outcome_costs_enabled` ablation switch** (`prism/env/safety_cost.py`,
+   `prism/env/nuplan_env.py`, `scripts/train.py`) — new `SafetyCostBuilder.__init__`
+   param, default `True` (unchanged baseline behavior). When `False`, Tier-1 outcome
+   events no longer contribute to `c_outcome`; their boolean flags (`vru_collision`,
+   `off_road`, etc.) are still set every step, so infraction telemetry stays complete
+   even when a component is excluded from cost. Threaded through
+   `make_prism_env(outcome_costs_enabled=...)` and read from `cfg["outcome_costs_enabled"]`
+   in `scripts/train.py`'s `_build_env()`.
+
+**2. `active_indicators` ablation switch** (same three files) — new
+   `SafetyCostBuilder.__init__` param, a list of indicator names (`"ttc"`, `"thw"`,
+   `"speed"`, `"blind_spot"`, `"red_light"`) or `None` (default, all active — unchanged
+   baseline behavior). Same flag-always-set / contribution-gated pattern as #1, via a new
+   `_indicator_enabled()` helper.
+
+**3. `cost_scale` ablation switch** (`prism/env/nuplan_env.py`) — new `PRISMEnv.__init__`
+   param, default `1.0`. Applied ONCE, in `PRISMEnv.step()`, as a uniform multiplier on
+   the raw per-step safety cost `c_t` before it feeds `e_t` accumulation — deliberately
+   NOT applied inside `SafetyCostBuilder` (episode caps stay expressed/enforced in their
+   original calibrated units from `hyperparams.json`; only the final scalar is rescaled).
+   `info["safety_cost_raw"]` is added (unscaled) alongside the existing (now scaled)
+   `info["safety_cost"]`, for diagnostics.
+
+**4. `fixed_alpha` ablation switch** (`prism/morl/dpmorl_trainer.py`) — new `cfg` key,
+   default `None` (unchanged curriculum behavior via the existing `AlphaSchedule`). When
+   set, `DPMORLTrainer.train()` uses this constant alpha for every update, bypassing
+   `alpha_start`/`alpha_end`/`n_curriculum_iters` entirely. Chosen as `0.5` (median) for
+   this experiment specifically because it isolates the curriculum-driven component of
+   `nu`'s movement while also being a lower-variance quantile to estimate from a rolling
+   buffer than 0.9+ would be. Note for later: alpha=0.5 is a debug-only choice — CVaR's
+   value proposition is tail risk, so the eventual model still needs a fixed HIGH alpha
+   (0.9-0.95, still no curriculum) tested once this diagnostic clarifies whether
+   `nu`-non-stationarity is a real contributor.
+
+**5. This run's specific combination** (`configs/prism_instability_experiment.yaml`, new
+   file, and `make train-instability-mini`, new Makefile target) — copies
+   `prism_default.yaml` with `outcome_costs_enabled: false`, `cost_scale: 0.5`,
+   `active_indicators: [ttc]`, `fixed_alpha: 0.5`. TTC chosen as the single indicator
+   both because it is the most standard risk-sensitive signal in the AV safety
+   literature (easiest to cite/justify) and because "K policies, different driving
+   styles, all respecting one TTC-based safety rule" is a clean, defensible fallback
+   publishable result if the full 5-indicator + outcome-cost system doesn't converge
+   before the ICRA deadline. `cost_scale=0.5` is a starting guess to bring indicator-only
+   cost magnitude (~2-7/step, uncut) closer to reward's bounded `(0,1]`-ish per-step
+   scale without eliminating the safety signal — not a precisely derived value; the
+   `mu_c`/`z_T` ratio should be checked empirically in the first ~50 updates of the real
+   run and this factor revisited if still grossly mismatched.
+
+**6. Gradient-norm-by-group diagnostic** (`prism/models/base.py`: new
+   `PRISMPolicyBase.cost_critic_parameters()`, default empty, overridden in both
+   `CaRLPPOAdapter` and `AlpamayoAdapter`; `prism/morl/dpmorl_trainer.py`'s
+   `_ppo_update()`) — after `total_loss.backward()` but BEFORE
+   `clip_grad_norm_` (which rescales `.grad` in place), splits the combined loss's
+   gradient norm into cost-critic vs. everything else, at zero extra backward-pass cost
+   (pure `.grad` inspection). Directly tests hypothesis "the cost critic's gradients
+   dominate the shared clip" — previously asserted from log correlation, not measured.
+   `clip_grad_norm_`'s own return value (the pre-clip TOTAL norm) is also captured.
+   Logged every update as `grad_norm_total_preclip` / `grad_norm_cost_critic` /
+   `grad_norm_other`.
+
+**7. Verbose per-update metrics + GPU utilization logging** (`prism/utils/metrics_logger.py`,
+   `prism/utils/gpu_monitor.py`, both new; wired into `dpmorl_trainer.py`'s `__init__`/
+   `train()`) — requested so a full run can be analyzed offline in pandas instead of
+   depending on terminal scrollback:
+   - `MetricsLogger` writes one JSON line per update (not just every 100th, unlike the
+     existing INFO log) to `{output_dir}/policy_{id}_metrics.jsonl`: every existing
+     diagnostic (`alpha`, `var_nu`, `cvar_hat`, `mu_c`, `sigma_c`, `reward_loss`,
+     `cost_penalty`, `cost_critic_loss`, `total_loss`, NaN/streak state) plus the new
+     grad-norm-by-group fields, per-update episode-cost mean/std (this update's ~3-4
+     episodes, distinct from the buffer's rolling `mu_c`/`sigma_c` — a check on the
+     small-sample-noise hypothesis), and a timing breakdown
+     (`rollout_time_s`/`ppo_update_time_s`/`update_total_time_s`). The first line is a
+     `record_type: "config"` record echoing all static hyperparameters and the 4 ablation
+     toggles above, so the file is self-describing without also needing the run's YAML.
+   - `GPUMonitor` samples `nvidia-smi` (utilization%, memory used/total, temperature,
+     power draw) every `cfg["gpu_log_interval_s"]` seconds (default 2.0) in a background
+     thread, for the explicit purpose of telling whether the training-speed bottleneck is
+     GPU-bound (in which case a better GPU would help) or something else (data loading,
+     simulation stepping, CPU-bound reward/cost computation). Full-resolution samples
+     stream to `{output_dir}/policy_{id}_gpu.jsonl`; a windowed average
+     (`average_window()`) is also embedded into each update's metrics line. Chose
+     `nvidia-smi` subprocess parsing over `pynvml` deliberately — no extra Python
+     dependency to install on the lab machine, `nvidia-smi` ships with any NVIDIA driver.
+     Probes once on construction and disables itself (single WARNING, never raises) if
+     `nvidia-smi` is unavailable — GPU logging must not be able to break training.
+   - `DPMORLTrainer.train()` was split into `train()` (setup + `_gpu_monitor.start()` /
+     `try: self._train_loop(...) finally: stop()+close()` / final checkpoint) and a new
+     `_train_loop()` holding the per-update body — needed so the GPU monitor and metrics
+     file close cleanly even when the existing A2 NaN-halt `RuntimeError` fires
+     mid-training (verified: the halting update's metrics line is still written, since
+     logging happens before the halt check, not after).
+
+### Verification
+
+- `python -m pytest tests/` — 44/44 passing (no regressions).
+- `SafetyCostBuilder` toggle behavior (outcome flag-vs-cost split, indicator
+  flag-vs-cost split) verified against hand-constructed fake ego-state/detection-cache
+  objects — confirmed flags always set, cost contribution correctly gated.
+- `cost_critic_parameters()` verified as a strict subset of `trainable_parameters()` for
+  `CaRLPPOAdapter`, and verified to return an empty iterator (no crash) for
+  `AlpamayoAdapter` when constructed with `cost_critic=None`.
+- Full trainer smoke test (fake CaRL policy + fake env, CPU, no nuPlan/GPU dependency):
+  `fixed_alpha=0.5` confirmed to pin `alpha` at exactly 0.5 across every update
+  (curriculum bypassed); `metrics.jsonl` confirmed to contain one config record (all 4
+  ablation toggles correctly echoed) plus one update record per training update, with
+  `grad_norm_cost_critic` nonzero on at least one update (confirms the split is wired to
+  real parameters, not silently always zero).
+- `GPUMonitor` confirmed to disable gracefully (no exception) on this CPU-only dev
+  machine (`nvidia-smi` unavailable) — `average_window()` returns `None` rather than
+  raising. NOT verified against a real GPU / real `nvidia-smi` output — first real signal
+  on that comes from the actual lab-machine run.
+- A1 (telescoping WARNING) and A2 (NaN/Inf halt after 3 consecutive updates) sanity
+  checks re-run against the `train()`/`_train_loop()` split — both still fire correctly;
+  confirmed the halting update's metrics line is written before the `RuntimeError`
+  propagates through the `try/finally`.
+- **Not verifiable here, flagged for the lab machine**: real GPU utilization numbers
+  (only a CPU dev box is available in this checkout); whether `cost_scale=0.5` actually
+  brings cost and reward magnitudes into a comparable range (needs the real `mu_c` vs
+  `z_T` numbers from the first ~50 updates); whether this combination is actually stable
+  over a full run — that is the entire point of running it.
+
+### Outstanding
+
+- [ ] Run `make train-instability-mini` (or the full-dataset equivalent) on the lab
+      server and review `runs/instability_ttc/policy_0_metrics.jsonl` +
+      `policy_0_gpu.jsonl`.
+- [ ] If stable: cost formulation was likely dominant — plan the next experiment (fixed
+      HIGH alpha, e.g. 0.9-0.95, no curriculum) to confirm CVaR's tail-risk framing still
+      trains stably before reintroducing outcome costs incrementally.
+- [ ] If still visibly unstable (smaller magnitude but still spiky `cost_critic_loss` /
+      oscillating `var_nu`): `nu`-non-stationarity is independently significant — consider
+      a target-network-style soft update for `nu` (EMA) as the next change, per the DQN
+      moving-target analogy in the motivation section above.
+- [ ] Reward-only (`beta=0`, `cf_coef=0`) and cost-only (`reward_weight=0`, `beta=1`)
+      ablations remain deferred, not part of this experiment — would need a new
+      symmetric `reward_weight` config knob (not yet implemented).

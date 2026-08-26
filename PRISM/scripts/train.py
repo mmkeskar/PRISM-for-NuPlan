@@ -189,6 +189,9 @@ def _build_env(cfg: dict, hp: dict, utility_fn, zt_normaliser):
         gamma=cfg.get("gamma", 0.99),
         zt_normaliser=zt_normaliser,
         terminate_on_failure=False,
+        outcome_costs_enabled=cfg.get("outcome_costs_enabled", True),
+        active_indicators=cfg.get("active_indicators", None),
+        cost_scale=cfg.get("cost_scale", 1.0),
     )
 
     # Inject env back-reference so the camera builder can resolve the log file path

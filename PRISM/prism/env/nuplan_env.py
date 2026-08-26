@@ -100,6 +100,8 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         regime_detector: RegimeDetector,
         terminate_on_collision: bool = True,
         terminate_on_off_road: bool = True,
+        outcome_costs_enabled: bool = True,
+        active_indicators: Optional[list] = None,
     ) -> None:
         self._area = environment_area
         self._hp = hp
@@ -107,7 +109,11 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         self._terminate_collision = terminate_on_collision
         self._terminate_off_road = terminate_on_off_road
 
-        self._safety = SafetyCostBuilder(hp)
+        self._safety = SafetyCostBuilder(
+            hp,
+            outcome_costs_enabled=outcome_costs_enabled,
+            active_indicators=active_indicators,
+        )
 
         # Episode state
         self._prev_accel_lon: Optional[float] = None
@@ -418,12 +424,18 @@ class PRISMEnv(EnvironmentWrapper):
         utility_fn: Callable[[np.ndarray], float],
         gamma: float = 0.99,
         zt_normaliser: Optional[ZtNormaliser] = None,
+        cost_scale: float = 1.0,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._utility_fn = utility_fn
         self._gamma = gamma
         self._zt_normaliser = zt_normaliser or ZtNormaliser(reward_dim=_REWARD_DIM)
+        # Ablation knob (instability-analysis experiments): uniform multiplier
+        # applied to the raw per-step safety cost c_t before it feeds e_t --
+        # brings cost magnitude closer to reward magnitude without touching
+        # the calibrated indicator/outcome weights in hyperparams.json.
+        self._cost_scale = cost_scale
 
         self._zt = np.zeros(_REWARD_DIM, dtype=np.float64)
         self._et = 0.0
@@ -454,8 +466,13 @@ class PRISMEnv(EnvironmentWrapper):
 
         # Extract style reward and safety cost from info (set by PRISMRewardBuilder)
         r_vec = info.pop("style_reward", np.zeros(_REWARD_DIM, dtype=np.float64))
-        c_t = float(info.pop("safety_cost", 0.0))
+        c_t_raw = float(info.pop("safety_cost", 0.0))
+        # cost_scale applied here, uniformly, once -- everything downstream
+        # (e_t accumulation, info["safety_cost"] for the trainer's episode-
+        # cost/dense-signal computation) sees the SCALED value consistently.
+        c_t = c_t_raw * self._cost_scale
         info["safety_cost"] = c_t  # re-expose so trainer can accumulate per-step costs
+        info["safety_cost_raw"] = c_t_raw  # unscaled, for diagnostics
 
         # z_{t+1} = z_t + gamma^t * r_t
         zt_next = self._zt + (self._gamma ** self._t) * np.asarray(r_vec, dtype=np.float64)
@@ -508,9 +525,22 @@ def make_prism_env(
     gamma: float = 0.99,
     zt_normaliser: Optional[ZtNormaliser] = None,
     terminate_on_failure: bool = False,
+    outcome_costs_enabled: bool = True,
+    active_indicators: Optional[list] = None,
+    cost_scale: float = 1.0,
 ) -> PRISMEnv:
     """
     Build a ready-to-use PRISMEnv from the standard CaRL builder objects.
+
+    Ablation knobs (instability-analysis experiments, all default to
+    unchanged baseline behavior when omitted):
+        outcome_costs_enabled: if False, Tier-1 outcome events (collision,
+            off-road, red light, wrong direction) no longer contribute to
+            c_t. Flags are still set for logging.
+        active_indicators: if given, only these Tier-2 indicators (from
+            "ttc", "thw", "speed", "blind_spot", "red_light") contribute to
+            c_t. Flags for excluded indicators are still set for logging.
+        cost_scale: uniform multiplier applied to c_t before it feeds e_t.
     """
     regime_detector = RegimeDetector(
         congestion_speed_fraction=hp.get("regime_detection", {}).get(
@@ -524,6 +554,8 @@ def make_prism_env(
         environment_area=environment_area,
         hp=hp,
         regime_detector=regime_detector,
+        outcome_costs_enabled=outcome_costs_enabled,
+        active_indicators=active_indicators,
     )
     return PRISMEnv(
         scenario_sampler=scenario_sampler,
@@ -535,4 +567,5 @@ def make_prism_env(
         utility_fn=utility_fn,
         gamma=gamma,
         zt_normaliser=zt_normaliser,
+        cost_scale=cost_scale,
     )

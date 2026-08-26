@@ -446,3 +446,8 @@ class AlpamayoAdapter(PRISMPolicyBase):
         if self._backbone is not None and self._backbone_phase == "b":
             params += [p for p in self._backbone.parameters() if p.requires_grad]
         return iter(params)
+
+    def cost_critic_parameters(self):
+        if self.cost_critic is None:
+            return iter(())
+        return iter(list(self.cost_critic.parameters()))

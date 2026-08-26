@@ -33,7 +33,7 @@ TORCH_CUDA_VERSION ?= cu121
 PYTHON            := python
 
 .PHONY: all setup check-env check cache cache-mini hyperparams hyperparams-mini \
-        check-hyperparams train train-mini test clean help
+        check-hyperparams train train-mini train-instability-mini test clean help
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default target
@@ -52,6 +52,7 @@ help:
 	@echo "  make hyperparams-mini   Compute hyperparams (mini, 200 rollouts)"
 	@echo "  make check-hyperparams  Validate hyperparams.json (PASS/FAIL per value)"
 	@echo "  make train-mini         Smoke-test training on mini dataset"
+	@echo "  make train-instability-mini  Instability-analysis experiment (mini dataset)"
 	@echo "  make cache              Build cache from full train dataset"
 	@echo "  make hyperparams        Compute hyperparams (full, 200 rollouts)"
 	@echo "  make train              Full PRISM training run"
@@ -184,6 +185,20 @@ train-mini:
 	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
 	    --cache_path  $(MINI_CACHE_PATH) \
 	    --output_dir  runs/mini_test \
+	    --n_policies  2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training — instability-analysis experiment (mini smoke test)
+# ─────────────────────────────────────────────────────────────────────────────
+
+train-instability-mini:
+	@echo "── Instability-analysis experiment (indicator-only TTC cost, mini dataset) ──"
+	$(PYTHON) scripts/train.py \
+	    --config     configs/prism_instability_experiment.yaml \
+	    --hyperparams hyperparams.json \
+	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
+	    --cache_path  $(MINI_CACHE_PATH) \
+	    --output_dir  runs/instability_ttc \
 	    --n_policies  2
 
 # ─────────────────────────────────────────────────────────────────────────────
