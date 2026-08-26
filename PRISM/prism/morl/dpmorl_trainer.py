@@ -304,6 +304,11 @@ class DPMORLTrainer:
             # terminations), neither of which was previously logged anywhere.
             local_episode_zts: List[np.ndarray] = []
             local_episode_lengths: List[int] = []
+            # Why each episode ended THIS update -- "collision"/"off_road"/
+            # "completed" (survived to scenario end / truncation). Direct
+            # capability signal, distinct from length alone (a stationary
+            # policy can also produce long episodes without driving well).
+            local_episode_outcomes: List[str] = []
             current_ep_id = 0
             current_ep_len = 0
 
@@ -345,6 +350,14 @@ class DPMORLTrainer:
                     current_ep_id += 1
                     local_episode_lengths.append(current_ep_len)
                     current_ep_len = 0
+
+                    comp = info.get("safety_components")
+                    if comp is not None and (comp.vru_collision or comp.vehicle_collision):
+                        local_episode_outcomes.append("collision")
+                    elif comp is not None and comp.off_road:
+                        local_episode_outcomes.append("off_road")
+                    else:
+                        local_episode_outcomes.append("completed")
 
                     if "episode_zt" in info:
                         self._buffer.episode_zts.append(info["episode_zt"].copy())
@@ -443,6 +456,26 @@ class DPMORLTrainer:
                 float(np.mean(self._buffer.rewards)) if self._buffer.rewards else None
             )
 
+            # Episode outcome breakdown THIS update -- direct capability
+            # signal (a stationary/timid policy can produce long episodes
+            # without driving anywhere; this distinguishes "survived because
+            # it drove well" from "survived because it barely moved").
+            n_eps_outcome = len(local_episode_outcomes)
+            outcome_stats = {
+                "frac_collision": (
+                    local_episode_outcomes.count("collision") / n_eps_outcome
+                    if n_eps_outcome else None
+                ),
+                "frac_off_road": (
+                    local_episode_outcomes.count("off_road") / n_eps_outcome
+                    if n_eps_outcome else None
+                ),
+                "frac_completed": (
+                    local_episode_outcomes.count("completed") / n_eps_outcome
+                    if n_eps_outcome else None
+                ),
+            }
+
             self._metrics.log_update({
                 "update": update + 1,
                 "policy_id": self.policy_id,
@@ -470,10 +503,13 @@ class DPMORLTrainer:
                 ),
                 "mean_reward_this_update": mean_reward_this_update,
                 **z_stats,
+                **outcome_stats,
                 "reward_loss": loss_info["reward_loss"],
                 "cost_penalty": loss_info["cost_penalty"],
                 "cost_critic_loss": loss_info["cost_critic_loss"],
                 "total_loss": loss_info["total_loss"],
+                "v_loss": loss_info["v_loss"],
+                "entropy": loss_info["entropy"],
                 "grad_norm_total_preclip": loss_info["grad_norm_total_preclip"],
                 "grad_norm_cost_critic": loss_info["grad_norm_cost_critic"],
                 "grad_norm_other": loss_info["grad_norm_other"],
@@ -633,6 +669,7 @@ class DPMORLTrainer:
             return {
                 "reward_loss": 0.0, "cost_penalty": 0.0,
                 "cost_critic_loss": 0.0, "total_loss": 0.0,
+                "v_loss": 0.0, "entropy": 0.0,
                 "nan_detected": False,
                 "grad_norm_total_preclip": 0.0,
                 "grad_norm_cost_critic": 0.0,
@@ -706,6 +743,8 @@ class DPMORLTrainer:
         epoch_cost_penalty = 0.0
         epoch_cost_critic_loss = 0.0
         epoch_total_loss = 0.0
+        epoch_v_loss = 0.0
+        epoch_entropy = 0.0
         epoch_grad_norm_total = 0.0
         epoch_grad_norm_cost_critic = 0.0
         epoch_grad_norm_other = 0.0
@@ -804,6 +843,8 @@ class DPMORLTrainer:
                 epoch_cost_penalty += float(cost_penalty_diag.item())
                 epoch_cost_critic_loss += float(cost_critic_loss.item())
                 epoch_total_loss += float(total_loss.item())
+                epoch_v_loss += float(v_loss.item())
+                epoch_entropy += float(ent_loss.item())
                 epoch_grad_norm_total += mb_grad_norm_total
                 epoch_grad_norm_cost_critic += mb_grad_norm_cost_critic
                 epoch_grad_norm_other += mb_grad_norm_other
@@ -814,6 +855,13 @@ class DPMORLTrainer:
             "cost_penalty": epoch_cost_penalty / max(n_minibatches, 1),
             "cost_critic_loss": epoch_cost_critic_loss / max(n_minibatches, 1),
             "total_loss": epoch_total_loss / max(n_minibatches, 1),
+            # v_loss: reward critic's own MSE -- should trend down as it
+            # learns to predict returns. entropy: should trend down as the
+            # policy commits to more confident actions (but collapsing to
+            # ~0 immediately would suggest premature convergence, not
+            # learning). Neither was previously surfaced past this method.
+            "v_loss": epoch_v_loss / max(n_minibatches, 1),
+            "entropy": epoch_entropy / max(n_minibatches, 1),
             "nan_detected": nan_detected,
             "grad_norm_total_preclip": epoch_grad_norm_total / max(n_minibatches, 1),
             "grad_norm_cost_critic": epoch_grad_norm_cost_critic / max(n_minibatches, 1),

@@ -669,3 +669,85 @@ personalization working at all.
       constrained-RL idea inside the already-correct v2 dual-critic architecture, not the
       buggy v1 REINFORCE mechanism) remains proposed, not implemented — deferred pending
       the DPMORL-only result above.
+
+---
+
+## 2026-08-26 — "Is it learning" logging fields + standalone analysis script
+
+### Motivation
+
+The 785-update read of the instability-analysis run's `metrics.jsonl` could only speak to
+whether the cost/CVaR math was numerically stable, not whether the policy was actually
+improving — no reward, style-vector, or episode-outcome signal was reaching the log at
+all. Asked directly whether the training was "working" in the sense of decreasing loss/CVaR
+and got an honest "no clean trend, and we can't even tell if driving is improving" answer.
+Fixing that gap is also a prerequisite for the newly-agreed plan (DPMORL-only run first,
+warm-start the safety run from it if styles diverge cleanly, investigate rewards from
+scratch if they don't) — that plan can't be judged without exactly this data.
+
+Also, `metrics.jsonl` files are growing into the multi-MB, thousands-of-lines range (the
+instability-analysis run is at 6522+ updates). Manually re-deriving binned trends by hand
+each time (as done for the two previous entries) doesn't scale — asked for a reusable
+script instead.
+
+### Changes
+
+**1. New per-update fields** (`prism/morl/dpmorl_trainer.py`):
+   - `v_loss`, `entropy` — the reward critic's own MSE loss and the policy's mean entropy,
+     both already computed inside `_ppo_update()`'s minibatch loop but never returned or
+     logged past that method. `v_loss` should trend down as the critic learns to predict
+     returns; `entropy` should trend down as the policy commits to more confident actions
+     (but collapsing to ~0 immediately would suggest premature convergence, not learning).
+   - `z_comfort` / `z_progress` / `z_lateral` / `z_spacing` — carried over from the prior
+     entry, unchanged.
+   - `mean_reward_this_update` — carried over from the prior entry, unchanged.
+   - `frac_collision` / `frac_off_road` / `frac_completed` — fraction of episodes completed
+     THIS update that ended in a collision, went off-road, or reached scenario
+     end/truncation. New `local_episode_outcomes` tracking in `_train_loop()`'s rollout
+     loop, classified from `info["safety_components"]`'s boolean flags (already set
+     unconditionally regardless of `outcome_costs_enabled`, per the first
+     instability-analysis entry) at each episode's terminal step. Deliberately a SEPARATE
+     signal from `mean_episode_length`: a stationary/timid policy can also produce long
+     episodes without driving anywhere, so length alone can't distinguish "surviving
+     because it drives well" from "surviving because it barely moves." Direct capability
+     signal, and directly relevant to interpreting the episode-count/cost spike found in
+     the prior entry's updates ~1300-3260 window.
+   - `grad_norm_*` fields unchanged (already added in the first instability-analysis
+     entry); no new gradient-diagnostic work here.
+
+**2. `scripts/analyze_metrics.py`** (new, standalone, stdlib-only) — parses one or more
+   `policy_*_metrics.jsonl` files (handles multiple config-record "runs" appended to the
+   same file from a restarted process, and a truncated final line from copying a file
+   still being written), and prints a concise report per file: config, wall-clock pace,
+   NaN/stability check, a binned trend table (cost/CVaR side + the new learning-signal
+   fields + episode outcomes + cost-critic gradient-norm fraction), z_T-by-dimension
+   early-vs-late trend, and a handful of early-half-vs-late-half directional flags
+   (explicitly framed as pointers to check against the binned table, not an automated
+   verdict — a flat/noisy metric can trip a >5% threshold either direction without meaning
+   anything). When multiple files are given (one per K policy), also prints a cross-policy
+   z_T comparison table assuming the standard K=4 preference ordering from
+   `_get_preference_vectors()`, to check whether each policy trends highest on its own
+   preferred dimension. Intended workflow: run this on the lab machine or after copying
+   the log over, share only the printed report, not the raw multi-MB file.
+
+### Verification
+
+- `python -m pytest tests/` — 44/44 passing.
+- Trainer smoke test with a fake env that cycles collision/off_road/completed outcomes:
+  confirmed `frac_collision`/`frac_off_road`/`frac_completed` sum to 1.0 each update and
+  correctly reflect the injected outcome sequence; confirmed `v_loss`/`entropy` populated.
+- `analyze_metrics.py` run against the real 6522-update instability-analysis log (older
+  format, predates `z_comfort`/`frac_*`/`v_loss`/`entropy`): reproduced the exact binned
+  `mu_c`/`cvar_hat`/`cost_critic_loss` trend derived by hand in the prior entry, printed
+  `n/a` gracefully for every missing field rather than crashing.
+- `analyze_metrics.py` run against fresh smoke-test output containing all new fields:
+  confirmed the full binned table, z_T section, and multi-file cross-policy comparison
+  code paths execute without error (too few updates in the smoke test itself for the
+  early/late-half comparison to populate, expected and harmless at that scale).
+
+### Outstanding
+
+- [ ] Run `make train-dpmorl-only-mini` with this logging in place; use
+      `scripts/analyze_metrics.py runs/dpmorl_only/policy_*_metrics.jsonl` to read the
+      result instead of manual analysis.
+- [ ] Everything else from the prior entry's Outstanding section still applies unchanged.
