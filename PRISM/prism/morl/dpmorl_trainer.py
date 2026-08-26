@@ -504,6 +504,9 @@ class DPMORLTrainer:
                 "total_loss": loss_info["total_loss"],
                 "v_loss": loss_info["v_loss"],
                 "entropy": loss_info["entropy"],
+                "ppo_loss": loss_info["ppo_loss"],
+                "approx_kl": loss_info["approx_kl"],
+                "clip_fraction": loss_info["clip_fraction"],
                 "nan_detected": loss_info["nan_detected"],
                 "nan_streak": self._nan_streak,
                 "rollout_time_s": rollout_end - rollout_start,
@@ -685,6 +688,7 @@ class DPMORLTrainer:
                 "reward_loss": 0.0, "cost_penalty": 0.0,
                 "cost_critic_loss": 0.0, "total_loss": 0.0,
                 "v_loss": 0.0, "entropy": 0.0,
+                "ppo_loss": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0,
                 "nan_detected": False,
                 "grad_norm_total_preclip": 0.0,
                 "grad_norm_cost_critic": 0.0,
@@ -760,6 +764,9 @@ class DPMORLTrainer:
         epoch_total_loss = 0.0
         epoch_v_loss = 0.0
         epoch_entropy = 0.0
+        epoch_ppo_loss = 0.0
+        epoch_approx_kl = 0.0
+        epoch_clip_fraction = 0.0
         epoch_grad_norm_total = 0.0
         epoch_grad_norm_cost_critic = 0.0
         epoch_grad_norm_other = 0.0
@@ -774,6 +781,20 @@ class DPMORLTrainer:
 
                 log_ratio = mb_out.log_prob - b_log_probs[mb]
                 ratio = log_ratio.exp()
+
+                # Actor-health diagnostics -- standard PPO metrics (matches
+                # what e.g. stable-baselines3 tracks), previously entirely
+                # absent: approx_kl estimates how much the policy moved this
+                # minibatch (Schulman's low-variance estimator: an unclipped
+                # surrogate ratio of 1 / zero log-ratio means no movement);
+                # clip_fraction is how often updates are hitting the trust-
+                # region boundary. Both actor-specific, computed regardless
+                # of whether the cost side is active.
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    clip_fraction = (
+                        (ratio - 1.0).abs() > clip_coef
+                    ).float().mean()
 
                 mb_adv_r = b_advantages[mb]
                 mb_adv_r = (mb_adv_r - mb_adv_r.mean()) / (mb_adv_r.std() + 1e-8)
@@ -860,6 +881,9 @@ class DPMORLTrainer:
                 epoch_total_loss += float(total_loss.item())
                 epoch_v_loss += float(v_loss.item())
                 epoch_entropy += float(ent_loss.item())
+                epoch_ppo_loss += float(ppo_loss.item())
+                epoch_approx_kl += float(approx_kl.item())
+                epoch_clip_fraction += float(clip_fraction.item())
                 epoch_grad_norm_total += mb_grad_norm_total
                 epoch_grad_norm_cost_critic += mb_grad_norm_cost_critic
                 epoch_grad_norm_other += mb_grad_norm_other
@@ -877,6 +901,14 @@ class DPMORLTrainer:
             # learning). Neither was previously surfaced past this method.
             "v_loss": epoch_v_loss / max(n_minibatches, 1),
             "entropy": epoch_entropy / max(n_minibatches, 1),
+            # Actor-specific health diagnostics (see the approx_kl/
+            # clip_fraction comment above where they're computed).
+            # ppo_loss: the actor's own clipped-surrogate objective, split
+            # out from total_loss (which also includes vf_coef*v_loss,
+            # cf_coef*cost_critic_loss, -ent_coef*ent_loss).
+            "ppo_loss": epoch_ppo_loss / max(n_minibatches, 1),
+            "approx_kl": epoch_approx_kl / max(n_minibatches, 1),
+            "clip_fraction": epoch_clip_fraction / max(n_minibatches, 1),
             "nan_detected": nan_detected,
             "grad_norm_total_preclip": epoch_grad_norm_total / max(n_minibatches, 1),
             "grad_norm_cost_critic": epoch_grad_norm_cost_critic / max(n_minibatches, 1),
