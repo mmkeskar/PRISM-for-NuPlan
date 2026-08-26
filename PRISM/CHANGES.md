@@ -581,3 +581,91 @@ Incidentally, the single update logged before the kill (`gpu_util_pct: 5.25`,
 (CPU-bound nuPlan simulation) dominates update wall-clock, not GPU compute — a
 preliminary signal (one data point, not conclusive) that training speed may not be
 GPU-bound at all.
+
+---
+
+## 2026-08-26 — DPMORL-only experiment (safety term off) + z_T / episode-length logging
+
+### Motivation
+
+785 updates into the indicator-only-TTC instability-analysis run (see previous entry),
+`cvar_hat`/`cost_critic_loss`/`mu_c` showed a real dip (updates ~400-620) followed by a
+rise back toward starting levels (updates ~700-785) — smaller in scale than the original
+full-cost run's divergence, but not fully resolved. Checked the two diagnostics built for
+exactly this purpose against the real data: `grad_norm_cost_critic` never exceeded ~23% of
+the total pre-clip gradient norm (rules out the shared-grad-clip-dominance hypothesis as
+the driver of THIS residual pattern), and `mean_episode_cost_this_update` (local, fresh
+episodes, no buffer lag possible) tracked the rolling buffer's `mu_c` closely rather than
+lagging it (rules out buffer staleness as the primary driver). Leading remaining
+hypothesis: `beta` is a fixed penalty weight, not an adaptive Lagrangian-style dual
+variable — nothing in the current design increases pressure when cost trends back up,
+which is a well-documented failure mode (bounded oscillation around the constraint
+boundary) for fixed-penalty constrained RL.
+
+Before chasing that further, it's worth checking a completely orthogonal question that
+instability-analysis so far has never isolated: does the DPMORL (personalization) half of
+the system work cleanly on its own, independent of the cost/safety side entirely? Every
+diagnosis so far has been on the cost side; if reward-only training is stable and produces
+K distinguishable driving styles, that further narrows the instability specifically to the
+`beta`/cost-critic interaction. If it doesn't, that's a more fundamental, unrelated
+problem — and worth knowing now, since every fallback plan (see prior entries) depends on
+personalization working at all.
+
+### Changes
+
+**1. DPMORL-only experiment config** (`configs/prism_dpmorl_only.yaml`, new, +
+   `make train-dpmorl-only-mini`, new Makefile target) — `beta: 0.0`, `cf_coef: 0.0`, no
+   other code path changes needed: both are already-existing config keys.
+   `A_total = A_reward - 0*A_cost = A_reward` drops the cost advantage out of the PPO
+   objective entirely, and `cf_coef=0` zeroes the cost critic's own gradient (via
+   `0 * cost_critic_loss` in `total_loss`) so it doesn't even consume shared grad-clip
+   budget, though the cost critic still runs a forward pass every step (harmless — same
+   architecture, safety term switched off, not a different code path). Verified the cost
+   critic's Adam moment estimates stay at zero throughout (zero grad every step -> zero
+   parameter update), so it doesn't drift from initialization while inert. K=4, same
+   curated preference vectors as the instability-analysis experiment.
+
+**2. z_T and episode-length logging** (`prism/morl/dpmorl_trainer.py`) — the one gap that
+   would have made the DPMORL-only experiment impossible to actually judge: `episode_zt`
+   was already available per completed episode (used for the in-memory `summary` dict) but
+   never reached the per-update metrics file. Added `local_episode_zts` /
+   `local_episode_lengths` tracking (parallel to the existing `local_episode_costs`
+   pattern) in `_train_loop()`'s rollout loop; new fields in `policy_{k}_metrics.jsonl`:
+   `z_comfort` / `z_progress` / `z_lateral` / `z_spacing` (mean z_T per style dimension
+   across episodes completed that update — `_STYLE_DIM_NAMES`, falls back to generic
+   `z_dim{i}` naming if a future config's `reward_dim` isn't 4), `mean_episode_length` /
+   `min_episode_length` / `max_episode_length` (cheap capability proxy — longer episodes
+   suggest fewer early terminations), and `mean_reward_this_update` (mean raw `R_t` across
+   the update's rollout, for judging reward-critic health). Judging the DPMORL-only
+   experiment: compare the 4 policies' `z_*` trends against each other — each should trend
+   higher on its OWN preferred dimension (per `_get_preference_vectors`) than the others.
+   These fields are populated for every experiment going forward, not just this one — in
+   particular they'll also retroactively help interpret the instability-analysis run's
+   `mu_c` rise (is it coming with longer episodes / more genuine traffic exposure, or not).
+
+### Verification
+
+- `python -m pytest tests/` — 44/44 passing.
+- Full trainer smoke test (fake CaRL policy + fake env, `beta=0`, `cf_coef=0`): confirmed
+  `z_comfort`/`z_progress`/`z_lateral`/`z_spacing`/`mean_episode_length`/
+  `min_episode_length`/`max_episode_length`/`mean_reward_this_update` all present in every
+  update record.
+- Re-ran the instability-analysis and A1/A2 sanity-check smoke tests from the prior two
+  entries against a clean output directory — both still pass unchanged (no regression from
+  the rollout-loop additions).
+- **Not verifiable here, flagged for the lab machine**: whether the 4 DPMORL-only policies
+  actually produce distinguishable styles, and whether reward-only training is itself
+  stable over a long run — that's the entire point of running it.
+
+### Outstanding
+
+- [ ] Run `make train-dpmorl-only-mini` and compare the 4 policies' `z_*` trends.
+- [ ] If DPMORL-only is stable and styles diverge as expected: strong evidence the
+      instability lives specifically in the `beta`/cost-critic interaction — prioritize
+      the adaptive-`beta` (dual-ascent) change over further cost-formulation ablations.
+- [ ] If DPMORL-only is ALSO unstable or styles don't diverge: unrelated, more fundamental
+      problem — re-scope investigation away from the CVaR/safety mechanism entirely.
+- [ ] Adaptive `beta` (dual-ascent-style, reintroducing the original Lagrangian
+      constrained-RL idea inside the already-correct v2 dual-critic architecture, not the
+      buggy v1 REINFORCE mechanism) remains proposed, not implemented — deferred pending
+      the DPMORL-only result above.

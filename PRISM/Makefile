@@ -33,7 +33,8 @@ TORCH_CUDA_VERSION ?= cu121
 PYTHON            := python
 
 .PHONY: all setup check-env check cache cache-mini hyperparams hyperparams-mini \
-        check-hyperparams train train-mini train-instability-mini test clean help
+        check-hyperparams train train-mini train-instability-mini train-dpmorl-only-mini \
+        test clean help
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default target
@@ -53,6 +54,7 @@ help:
 	@echo "  make check-hyperparams  Validate hyperparams.json (PASS/FAIL per value)"
 	@echo "  make train-mini         Smoke-test training on mini dataset"
 	@echo "  make train-instability-mini  Instability-analysis experiment (mini dataset)"
+	@echo "  make train-dpmorl-only-mini  DPMORL-only experiment, safety off (mini dataset)"
 	@echo "  make cache              Build cache from full train dataset"
 	@echo "  make hyperparams        Compute hyperparams (full, 200 rollouts)"
 	@echo "  make train              Full PRISM training run"
@@ -203,6 +205,19 @@ train-instability-mini:
 	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
 	    --cache_path  $(MINI_CACHE_PATH) \
 	    --output_dir  runs/instability_ttc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training — DPMORL-only experiment (safety term off, mini smoke test)
+# ─────────────────────────────────────────────────────────────────────────────
+
+train-dpmorl-only-mini:
+	@echo "── DPMORL-only experiment (beta=0, cf_coef=0, mini dataset, K=4) ──"
+	$(PYTHON) scripts/train.py \
+	    --config     configs/prism_dpmorl_only.yaml \
+	    --hyperparams hyperparams.json \
+	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
+	    --cache_path  $(MINI_CACHE_PATH) \
+	    --output_dir  runs/dpmorl_only
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training — full run

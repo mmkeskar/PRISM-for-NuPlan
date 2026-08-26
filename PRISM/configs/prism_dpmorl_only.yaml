@@ -1,0 +1,110 @@
+# PRISM DPMORL-only experiment config.
+#
+# Isolates the personalization/reward side of PRISM from the safety/CVaR
+# side entirely: beta=0 drops the cost advantage out of the combined PPO
+# objective (A_total = A_reward - 0*A_cost = A_reward), and cf_coef=0
+# zeroes the cost critic's own gradient too, so it doesn't even consume
+# shared grad-clip budget. No other code path changes -- the cost critic
+# and safety cost computation still run (harmless, just inert), so this is
+# the SAME v2 architecture with the safety term switched off, not a
+# different code path.
+#
+# Purpose: instability-analysis so far has only diagnosed the cost/safety
+# side (see CHANGES.md, branch instability-analysis). This checks whether
+# the OTHER half of the system -- DPMORL producing K distinguishable
+# driving styles via the utility-function/z_t machinery -- works cleanly on
+# its own. If it does (stable training, K policies' mean z_T logged per
+# update diverge in the expected direction), that further narrows the
+# instability to the beta/cost-critic interaction specifically. If it
+# doesn't, that's a more fundamental problem, unrelated to CVaR/safety.
+#
+# Success is judged from the new z_comfort/z_progress/z_lateral/z_spacing
+# fields in policy_{k}_metrics.jsonl (mean z_T per style dimension, per
+# update) -- compare the 4 policies' trends against each other; each should
+# trend higher on ITS OWN preferred dimension than the others do.
+#
+# Otherwise identical to prism_default.yaml (K=4, same as the
+# instability-analysis experiment, for full style-dimension coverage and
+# faster sequential wall-clock).
+
+# ── Experiment ───────────────────────────────────────────────────────────────
+experiment_name: prism_dpmorl_only_001
+seed: 42
+
+# ── nuPlan data ──────────────────────────────────────────────────────────────
+nuplan_data_root: /data/nuplan/dataset
+nuplan_map_root: /data/nuplan/maps
+cache_path: /data/prism_cache
+log_names: []
+
+# ── PRISM MORL ───────────────────────────────────────────────────────────────
+n_policies: 4
+reward_dim: 4
+gamma: 0.99
+
+stage1:
+  mode: preferences
+  n_iters: 2000
+  lr: 1.0e-3
+  diversity_weight: 1.0
+
+stage2:
+  n_updates: 10000
+  steps_per_update: 512
+  update_epochs: 4
+  minibatch_size: 64
+  clip_coef: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  max_grad_norm: 0.5
+  gae_lambda: 0.95
+  learning_rate: 3.0e-4
+  save_every: 500
+
+# ── Safety term switched off (the only substantive change vs.
+#    prism_default.yaml) ───────────────────────────────────────────────────────
+beta: 0.0
+cf_coef: 0.0
+tau: 20.0
+cvar_buffer_size: 500
+
+alpha_start: 0.20
+alpha_end: 0.95
+n_curriculum_iters: 5000
+
+gpu_log_interval_s: 20.0
+
+# ── Observation / action space ───────────────────────────────────────────────
+bev_semantics_channels: 15
+bev_semantics_height: 192
+bev_semantics_width: 192
+obs_num_measurements: 10
+num_value_measurements: 4
+action_space_dim: 2
+
+# ── CaRL simulation config ───────────────────────────────────────────────────
+simulation:
+  controller_type: one_stage
+  proposal_sampling:
+    num_poses: 40
+    interval_length: 0.1
+  max_episode_steps: 150
+
+scenario_types: null
+log_splits:
+  - train
+
+# ── Hardware ─────────────────────────────────────────────────────────────────
+cuda: true
+device: cuda:0
+num_envs: 1
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+output_dir: runs/
+track: false
+wandb_project: prism
+wandb_entity: null
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+eval_scenarios: val14
+n_eval_episodes: 200

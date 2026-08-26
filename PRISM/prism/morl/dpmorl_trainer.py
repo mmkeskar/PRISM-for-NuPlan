@@ -74,6 +74,12 @@ from prism.utils.metrics_logger import MetricsLogger
 
 logger = logging.getLogger(__name__)
 
+# Style reward vector dimension names (comfort, progress, lateral, spacing --
+# see prism/env/nuplan_env.py's _REWARD_DIM), used only to label the
+# per-update mean-z_T fields below. Falls back to generic z_dim{i} names if
+# a future config's reward_dim doesn't match len 4.
+_STYLE_DIM_NAMES = ("comfort", "progress", "lateral", "spacing")
+
 _ZERO_COST_WARN_STREAK = 10   # consecutive updates with all-zero episode cost
 _TELESCOPING_REL_TOL = 1e-4   # per-episode runtime check tolerance
 _NAN_HALT_STREAK = 3          # consecutive updates with NaN/Inf before halting
@@ -291,10 +297,19 @@ class DPMORLTrainer:
             self._buffer.clear()
             episode_step_costs: List[float] = []
             local_episode_costs: List[float] = []
+            # z_T and episode length, per completed episode THIS update --
+            # the one thing needed to judge whether K policies are actually
+            # learning distinguishable styles (DPMORL-only experiments) and
+            # a cheap capability proxy (longer episodes ~ fewer early
+            # terminations), neither of which was previously logged anywhere.
+            local_episode_zts: List[np.ndarray] = []
+            local_episode_lengths: List[int] = []
             current_ep_id = 0
+            current_ep_len = 0
 
             for _ in range(steps_per_update):
                 self._global_step += 1
+                current_ep_len += 1
 
                 with torch.no_grad():
                     out = self.agent.forward(next_obs)
@@ -328,10 +343,13 @@ class DPMORLTrainer:
                     self._cost_buffer.add_episode(ep_cost)
                     episode_step_costs = []
                     current_ep_id += 1
+                    local_episode_lengths.append(current_ep_len)
+                    current_ep_len = 0
 
                     if "episode_zt" in info:
                         self._buffer.episode_zts.append(info["episode_zt"].copy())
                         summary["episode_zts"].append(info["episode_zt"].copy())
+                        local_episode_zts.append(info["episode_zt"].copy())
 
                     obs, _ = self.env.reset()
                     next_obs = {
@@ -407,6 +425,24 @@ class DPMORLTrainer:
 
             # ── Verbose per-update metrics (every update, not just every 100th) ──
             gpu_stats = self._gpu_monitor.average_window(update_start) or {}
+
+            # Mean z_T across episodes completed THIS update, per style
+            # dimension -- the signal needed to judge whether K policies are
+            # producing distinguishable driving styles (e.g. DPMORL-only
+            # runs with beta=0), not previously logged anywhere.
+            z_stats = {}
+            if local_episode_zts:
+                mean_zt = np.mean(np.stack(local_episode_zts), axis=0)
+                names = (
+                    _STYLE_DIM_NAMES if len(mean_zt) == len(_STYLE_DIM_NAMES)
+                    else tuple(f"z_dim{i}" for i in range(len(mean_zt)))
+                )
+                z_stats = {f"z_{name}": float(v) for name, v in zip(names, mean_zt)}
+
+            mean_reward_this_update = (
+                float(np.mean(self._buffer.rewards)) if self._buffer.rewards else None
+            )
+
             self._metrics.log_update({
                 "update": update + 1,
                 "policy_id": self.policy_id,
@@ -423,6 +459,17 @@ class DPMORLTrainer:
                 "std_episode_cost_this_update": (
                     float(np.std(local_episode_costs)) if local_episode_costs else None
                 ),
+                "mean_episode_length": (
+                    float(np.mean(local_episode_lengths)) if local_episode_lengths else None
+                ),
+                "min_episode_length": (
+                    min(local_episode_lengths) if local_episode_lengths else None
+                ),
+                "max_episode_length": (
+                    max(local_episode_lengths) if local_episode_lengths else None
+                ),
+                "mean_reward_this_update": mean_reward_this_update,
+                **z_stats,
                 "reward_loss": loss_info["reward_loss"],
                 "cost_penalty": loss_info["cost_penalty"],
                 "cost_critic_loss": loss_info["cost_critic_loss"],
