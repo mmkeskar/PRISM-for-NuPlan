@@ -560,3 +560,24 @@ not a substantive run) — since CLI `--n_policies` overrides the config file's
 this would have silently run K=2 regardless of what `prism_instability_experiment.yaml`
 specified. Removed the CLI override; `n_policies: 4` in the YAML is now the sole source
 of truth for this target.
+
+### Addendum — GPUMonitor sample interval 2.0s → 15.0s default (20.0s for this experiment)
+
+First real (lab-machine) run reported the whole machine (used for both training and
+interactive desktop work) becoming severely sluggish; the run was killed after a single
+update. Suspected cause: `GPUMonitor` spawns a fresh `nvidia-smi` subprocess from a
+background thread every `gpu_log_interval_s` — at 2.0s this is frequent enough to add
+real fork/exec + GPU-driver-query overhead, plausibly contending with the training
+process's own CUDA calls on some driver setups. Not conclusively proven (only one
+update's data exists from that run), but low-risk and easy to fix: raised the code
+default (`dpmorl_trainer.py`) from 2.0s to 15.0s and this experiment's config value to
+20.0s — roughly 10x fewer subprocess spawns, still ample resolution over a run spanning
+thousands of updates. If system-wide slowdown persists at the new interval, GPU
+utilization logging should be suspected less and something else (e.g. driver-level
+contention independent of poll frequency, or unrelated system load) investigated instead.
+
+Incidentally, the single update logged before the kill (`gpu_util_pct: 5.25`,
+`rollout_time_s: 7.32` vs `ppo_update_time_s: 0.82`) suggests rollout collection
+(CPU-bound nuPlan simulation) dominates update wall-clock, not GPU compute — a
+preliminary signal (one data point, not conclusive) that training speed may not be
+GPU-bound at all.

@@ -141,7 +141,10 @@ class DPMORLTrainer:
         `fixed_alpha` (instability-analysis ablation: constant alpha for
         the whole run, bypassing alpha_start/alpha_end/n_curriculum_iters
         entirely, when set) and `gpu_log_interval_s` (GPUMonitor sample
-        interval, default 2.0s). The env-level ablation toggles
+        interval, default 15.0s -- kept coarse deliberately: each sample
+        spawns an `nvidia-smi` subprocess from a background thread, which
+        at a too-short interval can noticeably load a machine used for both
+        training and interactive desktop work). The env-level ablation toggles
         (`outcome_costs_enabled`, `active_indicators`, `cost_scale`) are
         consumed in scripts/train.py's _build_env(), not here -- they're
         only echoed into this trainer's metrics-log config record for
@@ -209,7 +212,7 @@ class DPMORLTrainer:
         gpu_index = device.index if device.type == "cuda" and device.index is not None else 0
         self._gpu_monitor = GPUMonitor(
             device_index=gpu_index,
-            interval_s=cfg.get("gpu_log_interval_s", 2.0),
+            interval_s=cfg.get("gpu_log_interval_s", 15.0),
             log_path=self.output_dir / f"policy_{policy_id}_gpu.jsonl",
         )
         self._metrics.log_config({

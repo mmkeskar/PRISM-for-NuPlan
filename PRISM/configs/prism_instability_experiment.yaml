@@ -91,8 +91,13 @@ alpha_start: 0.20
 alpha_end: 0.95
 n_curriculum_iters: 5000
 
-# GPU utilization sampling interval for prism/utils/gpu_monitor.py
-gpu_log_interval_s: 2.0
+# GPU utilization sampling interval for prism/utils/gpu_monitor.py.
+# Was 2.0 -- suspected of causing severe system-wide slowdown on the lab
+# machine (used for both training and desktop work), since GPUMonitor spawns
+# a fresh `nvidia-smi` subprocess every interval from a background thread.
+# Raised to 20s: ~10x fewer subprocess spawns, still plenty of resolution
+# over a run spanning thousands of updates. See CHANGES.md.
+gpu_log_interval_s: 20.0
 
 # ── Observation / action space ───────────────────────────────────────────────
 bev_semantics_channels: 15
