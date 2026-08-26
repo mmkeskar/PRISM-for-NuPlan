@@ -197,6 +197,14 @@ class DPMORLTrainer:
         )
         self._beta = cfg.get("beta", 1.0)
         self._tau = cfg.get("tau", 20.0)
+        # Auto-detected, not a separate config key: when beta=0 AND cf_coef=0
+        # (e.g. DPMORL-only experiments), the entire cost/CVaR machinery is
+        # mathematically inert -- still computed (harmless), but logging it
+        # is pure noise for judging whether personalization is training.
+        # Gates the cost-diagnostic fields in the per-update metrics record
+        # below; the config record always logs beta/cf_coef themselves so
+        # it's still visible from the log which mode a run was in.
+        self._log_cost_diagnostics = self._beta != 0.0 or cfg.get("cf_coef", 0.5) != 0.0
 
         self._global_step = 0
         self._buffer = RolloutBuffer()
@@ -476,22 +484,11 @@ class DPMORLTrainer:
                 ),
             }
 
-            self._metrics.log_update({
+            record = {
                 "update": update + 1,
                 "policy_id": self.policy_id,
                 "global_step": self._global_step,
-                "alpha": alpha,
-                "var_nu": nu,
-                "cvar_hat": cvar_hat,
-                "mu_c": mu_c,
-                "sigma_c": sigma_c,
                 "n_episodes_this_update": len(local_episode_costs),
-                "mean_episode_cost_this_update": (
-                    float(np.mean(local_episode_costs)) if local_episode_costs else None
-                ),
-                "std_episode_cost_this_update": (
-                    float(np.std(local_episode_costs)) if local_episode_costs else None
-                ),
                 "mean_episode_length": (
                     float(np.mean(local_episode_lengths)) if local_episode_lengths else None
                 ),
@@ -504,24 +501,42 @@ class DPMORLTrainer:
                 "mean_reward_this_update": mean_reward_this_update,
                 **z_stats,
                 **outcome_stats,
-                "reward_loss": loss_info["reward_loss"],
-                "cost_penalty": loss_info["cost_penalty"],
-                "cost_critic_loss": loss_info["cost_critic_loss"],
                 "total_loss": loss_info["total_loss"],
                 "v_loss": loss_info["v_loss"],
                 "entropy": loss_info["entropy"],
-                "grad_norm_total_preclip": loss_info["grad_norm_total_preclip"],
-                "grad_norm_cost_critic": loss_info["grad_norm_cost_critic"],
-                "grad_norm_other": loss_info["grad_norm_other"],
-                "dense_cost_nan": dense_nan,
                 "nan_detected": loss_info["nan_detected"],
                 "nan_streak": self._nan_streak,
-                "zero_cost_streak": self._zero_cost_streak,
                 "rollout_time_s": rollout_end - rollout_start,
                 "ppo_update_time_s": ppo_end - ppo_start,
                 "update_total_time_s": time.time() - update_start,
                 **gpu_stats,
-            })
+            }
+            # Cost/CVaR diagnostics -- meaningless noise when beta=0 and
+            # cf_coef=0 (see self._log_cost_diagnostics above), so omitted
+            # entirely from the record rather than logged as inert zeros.
+            if self._log_cost_diagnostics:
+                record.update({
+                    "alpha": alpha,
+                    "var_nu": nu,
+                    "cvar_hat": cvar_hat,
+                    "mu_c": mu_c,
+                    "sigma_c": sigma_c,
+                    "mean_episode_cost_this_update": (
+                        float(np.mean(local_episode_costs)) if local_episode_costs else None
+                    ),
+                    "std_episode_cost_this_update": (
+                        float(np.std(local_episode_costs)) if local_episode_costs else None
+                    ),
+                    "reward_loss": loss_info["reward_loss"],
+                    "cost_penalty": loss_info["cost_penalty"],
+                    "cost_critic_loss": loss_info["cost_critic_loss"],
+                    "grad_norm_total_preclip": loss_info["grad_norm_total_preclip"],
+                    "grad_norm_cost_critic": loss_info["grad_norm_cost_critic"],
+                    "grad_norm_other": loss_info["grad_norm_other"],
+                    "dense_cost_nan": dense_nan,
+                    "zero_cost_streak": self._zero_cost_streak,
+                })
+            self._metrics.log_update(record)
 
             if self._nan_streak >= _NAN_HALT_STREAK:
                 logger.error(
