@@ -463,6 +463,13 @@ class DPMORLTrainer:
             mean_reward_this_update = (
                 float(np.mean(self._buffer.rewards)) if self._buffer.rewards else None
             )
+            # Does the raw reward signal actually vary at all? A near-zero
+            # std here regardless of what the mean is doing would mean
+            # there's little for the policy to distinguish between actions
+            # on -- separate question from whether the MEAN is trending up.
+            std_reward_this_update = (
+                float(np.std(self._buffer.rewards)) if self._buffer.rewards else None
+            )
 
             # Episode outcome breakdown THIS update -- direct capability
             # signal (a stationary/timid policy can produce long episodes
@@ -499,6 +506,7 @@ class DPMORLTrainer:
                     max(local_episode_lengths) if local_episode_lengths else None
                 ),
                 "mean_reward_this_update": mean_reward_this_update,
+                "std_reward_this_update": std_reward_this_update,
                 **z_stats,
                 **outcome_stats,
                 "total_loss": loss_info["total_loss"],
@@ -507,6 +515,7 @@ class DPMORLTrainer:
                 "ppo_loss": loss_info["ppo_loss"],
                 "approx_kl": loss_info["approx_kl"],
                 "clip_fraction": loss_info["clip_fraction"],
+                "reward_advantage_std": loss_info["reward_advantage_std"],
                 "nan_detected": loss_info["nan_detected"],
                 "nan_streak": self._nan_streak,
                 "rollout_time_s": rollout_end - rollout_start,
@@ -689,6 +698,7 @@ class DPMORLTrainer:
                 "cost_critic_loss": 0.0, "total_loss": 0.0,
                 "v_loss": 0.0, "entropy": 0.0,
                 "ppo_loss": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0,
+                "reward_advantage_std": 0.0,
                 "nan_detected": False,
                 "grad_norm_total_preclip": 0.0,
                 "grad_norm_cost_critic": 0.0,
@@ -728,6 +738,15 @@ class DPMORLTrainer:
             )
         returns = advantages + values
         cost_returns = cost_advantages + cost_values
+
+        # Spread of the RAW reward advantage, before per-minibatch
+        # normalization erases its scale. This is what actually drives the
+        # actor's gradient -- if it's near-zero regardless of what mean
+        # reward is doing, there's essentially no signal telling the actor
+        # which actions are better, independent of raw reward's own spread
+        # (the critic may already be absorbing most of the predictable
+        # variation, leaving little in the residual).
+        reward_advantage_std = float(np.std(advantages))
 
         # A2 -- NaN/Inf check on A_t^C (cost advantages).
         nan_detected = not bool(np.isfinite(cost_advantages).all())
@@ -909,6 +928,7 @@ class DPMORLTrainer:
             "ppo_loss": epoch_ppo_loss / max(n_minibatches, 1),
             "approx_kl": epoch_approx_kl / max(n_minibatches, 1),
             "clip_fraction": epoch_clip_fraction / max(n_minibatches, 1),
+            "reward_advantage_std": reward_advantage_std,
             "nan_detected": nan_detected,
             "grad_norm_total_preclip": epoch_grad_norm_total / max(n_minibatches, 1),
             "grad_norm_cost_critic": epoch_grad_norm_cost_critic / max(n_minibatches, 1),

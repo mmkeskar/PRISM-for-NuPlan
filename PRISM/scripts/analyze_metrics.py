@@ -186,8 +186,12 @@ def report_run(label, cfg, ups, n_bins=10):
               f"(near 0 = barely changing, growing over time can mean instability). "
               f"clip_fraction: share of minibatch samples hitting the PPO clip boundary "
               f"(rule of thumb: healthy is roughly 0.1-0.3; near 0 the whole run can mean "
-              f"steps are too small to matter, consistently >0.5 can mean too-large/unstable updates).")
-        print(f"{'range':>15} | {'ppo_loss':>9} {'approx_kl':>10} {'clip_frac':>10} {'entropy':>8}")
+              f"steps are too small to matter, consistently >0.5 can mean too-large/unstable updates). "
+              f"reward_advantage_std: spread of the RAW (pre-normalization) reward advantage -- "
+              f"this is what actually drives the actor's gradient; near 0 means little signal "
+              f"telling the actor which actions are better, regardless of what mean reward is doing.")
+        print(f"{'range':>15} | {'ppo_loss':>9} {'approx_kl':>10} {'clip_frac':>10} "
+              f"{'entropy':>8} {'adv_std':>9} {'rew_std':>9}")
         for chunk in bins:
             lo, hi = chunk[0]["update"], chunk[-1]["update"]
             print(
@@ -195,7 +199,9 @@ def report_run(label, cfg, ups, n_bins=10):
                 f"{fmt(mean(u.get('ppo_loss') for u in chunk), 5):>9} "
                 f"{fmt(mean(u.get('approx_kl') for u in chunk), 5):>10} "
                 f"{fmt(mean(u.get('clip_fraction') for u in chunk)):>10} "
-                f"{fmt(mean(u.get('entropy') for u in chunk)):>8}"
+                f"{fmt(mean(u.get('entropy') for u in chunk)):>8} "
+                f"{fmt(mean(u.get('reward_advantage_std') for u in chunk), 5):>9} "
+                f"{fmt(mean(u.get('std_reward_this_update') for u in chunk), 5):>9}"
             )
 
     # -- z_T style-dimension trend (if present) --
@@ -213,7 +219,8 @@ def report_run(label, cfg, ups, n_bins=10):
           f"this is a pointer not a verdict) --")
     for key, nd in [("cost_critic_loss", 4), ("cvar_hat", 3), ("v_loss", 4),
                      ("entropy", 3), ("approx_kl", 5), ("clip_fraction", 3),
-                     ("mean_reward_this_update", 4), ("frac_completed", 3)]:
+                     ("mean_reward_this_update", 4), ("std_reward_this_update", 4),
+                     ("reward_advantage_std", 5), ("frac_completed", 3)]:
         early, late = half_compare(ups, key)
         if early is None:
             continue
