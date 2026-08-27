@@ -416,8 +416,17 @@ def run_stage2(
     preference_vectors: list = None,
     backbone_phase: str = "a",
     phase_a_dir: Path = None,
+    policy_ids: list = None,
 ) -> None:
-    """Train K policies sequentially with their respective utility functions."""
+    """
+    Train K policies with their respective utility functions.
+
+    policy_ids: if given, only these indices are trained IN THIS PROCESS
+    (the rest of utility_fns/preference_vectors are simply skipped, not an
+    error) -- lets multiple concurrent OS processes each own a disjoint
+    subset for real wall-clock parallelism. None (default) trains all,
+    sequentially, exactly as before.
+    """
     n_policies = len(utility_fns)
     stage2_cfg = cfg.get("stage2", {})
     n_updates = stage2_cfg.get("n_updates", 10000)
@@ -425,6 +434,8 @@ def run_stage2(
     lr = stage2_cfg.get("learning_rate", 3e-4)
 
     for k, utility_fn in enumerate(utility_fns):
+        if policy_ids is not None and k not in policy_ids:
+            continue
         logger.info(f"\n{'='*60}")
         logger.info(f"[Stage 2] Training policy k={k} / {n_policies - 1}  "
                     f"[backbone phase {backbone_phase.upper()}]")
@@ -535,6 +546,24 @@ def parse_args():
                         help="Load pre-saved utility functions and go straight to Stage 2")
     parser.add_argument("--utility_fn_dir", type=str, default=None,
                         help="Directory containing saved utility function checkpoints")
+    parser.add_argument(
+        "--policy_ids", type=str, default=None,
+        help=(
+            "Comma-separated policy indices to train in THIS process (e.g. "
+            "'0' or '2,3'). Omit to train all n_policies sequentially "
+            "(default). Combine with --stage1_only once to save utility "
+            "functions, then launch one process per policy_id concurrently "
+            "(each with --skip_stage1 --utility_fn_dir pointing at that "
+            "saved Stage 1 output) to train K policies at the same time on "
+            "the same machine -- separate OS processes, not batched math: "
+            "the actual per-update bottleneck is CPU-bound nuPlan rollout "
+            "collection (the large majority of update time), not GPU compute, so this is "
+            "real wall-clock parallelism where matrix-batching the network "
+            "forward/backward wouldn't help. Each policy already writes to "
+            "its own policy_{k}/ subdirectory, so concurrent processes "
+            "never touch the same output files."
+        ),
+    )
     parser.add_argument("--cache_path", type=str, default=None,
                         help="Override cache_path from config (path to CaRL scenario cache)")
     # ── Backbone phase (Alpamayo experiment) ─────────────────────────────────
@@ -688,6 +717,9 @@ def main():
         return
 
     # ── Stage 2 ───────────────────────────────────────────────────────────────
+    policy_ids = (
+        [int(x) for x in args.policy_ids.split(",")] if args.policy_ids else None
+    )
     run_stage2(
         utility_fns=utility_fns,
         cfg=cfg,
@@ -697,6 +729,7 @@ def main():
         preference_vectors=preference_vectors,
         backbone_phase=backbone_phase or "a",
         phase_a_dir=phase_a_dir,
+        policy_ids=policy_ids,
     )
 
     logger.info(f"\nTraining complete.  Results in: {output_dir}")

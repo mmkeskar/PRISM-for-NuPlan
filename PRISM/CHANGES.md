@@ -1050,3 +1050,61 @@ being purely orthogonal.
 - [ ] Both fixes apply automatically to the next training run (no config change needed) --
       restart `make train-dpmorl-only-mini` with all fixes from today's entries in place.
 - [ ] Everything else from today's earlier entries' Outstanding sections still applies.
+
+---
+
+## 2026-08-27 (cont.) — `--policy_ids` for running K policies as concurrent processes
+
+### Motivation
+
+Asked whether K policies could train "simultaneously via matrix math." They can't
+meaningfully -- `rollout_time_s` (CPU-bound nuPlan simulation) dominates `ppo_update_time_s`
+(the actual GPU/tensor math) by roughly an order of magnitude in every run analyzed so far,
+so batching the network computation across policies would only shave a few percent off
+wall-clock. The real lever is process-level parallelism: run each policy's full
+rollout+update loop as a separate OS process, on a separate CPU core, concurrently. GPU
+utilization has been consistently low (5-16%) in every run, so one GPU has ample headroom
+for K lightweight models running concurrently -- the limiting resource is CPU cores, not GPU.
+
+### Change
+
+`scripts/train.py`: new `--policy_ids` CLI flag (comma-separated indices, e.g. `"0"` or
+`"2,3"|`), threaded through to `run_stage2(policy_ids=...)`, which now skips any `k` not in
+the given set (`None`, the default, trains all `n_policies` sequentially -- unchanged prior
+behavior). Each policy already writes to its own `policy_{k}/` subdirectory, so concurrent
+processes never touch the same output files -- no restructuring needed beyond the filter
+itself. Combines with the existing (pre-existing, unmodified) `--stage1_only` /
+`--skip_stage1 --utility_fn_dir` flags: run Stage 1 once to save utility functions, then
+launch one process per policy pointed at that same saved output, e.g. for K=2:
+
+```
+python scripts/train.py --config configs/prism_dpmorl_only.yaml --stage1_only \
+    --output_dir runs/dpmorl_only
+python scripts/train.py --config configs/prism_dpmorl_only.yaml \
+    --skip_stage1 --utility_fn_dir runs/dpmorl_only/prism_dpmorl_only_001/stage1 \
+    --output_dir runs/dpmorl_only --policy_ids 0 &
+python scripts/train.py --config configs/prism_dpmorl_only.yaml \
+    --skip_stage1 --utility_fn_dir runs/dpmorl_only/prism_dpmorl_only_001/stage1 \
+    --output_dir runs/dpmorl_only --policy_ids 1 &
+wait
+```
+
+### Verification
+
+- `python -m pytest tests/` -- 56/56 passing (no logic in the tested modules touched).
+- `python scripts/train.py --help` -- caught and fixed a real bug introduced while writing
+  this: a literal `%` in the new flag's help text broke argparse's help formatter (`%` is a
+  format-string directive there), crashing `--help` entirely. Fixed by rewording; `--help`
+  now runs cleanly and shows the new flag.
+- Not run end-to-end on the lab machine (needs the actual nuPlan/CaRL environment) -- flagged
+  for the user to try when launching the next DPMORL-only run.
+
+### Outstanding
+
+- [ ] Try the concurrent-process workflow above on the next DPMORL-only restart; watch CPU
+      usage (e.g. `htop`) to see whether the machine has enough cores for a real ~2x speedup
+      or whether concurrent simulation contends and the gain is smaller.
+- [ ] Not addressed: the K policies still train fully independent backbones (each
+      `_build_agent()` call constructs a fresh network, no backbone sharing across policies)
+      -- unrelated to this change, noted here only because it came up while reading this code
+      path; a shared-backbone design would be a much bigger change, out of scope for now.
