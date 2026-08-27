@@ -880,3 +880,106 @@ Config-only change; confirmed `configs/prism_dpmorl_only.yaml` parses with
       driver -- look elsewhere (e.g. the log_prob/ratio computation's own gradient
       contribution to log_std, or the advantage-normalization mechanism itself).
 - [ ] Everything else from the prior two entries' Outstanding sections still applies.
+
+---
+
+## 2026-08-27 — Root cause found: reward barely differentiated between policies at all
+
+### Motivation
+
+The 6560-update run with ent_coef=0.0 (previous entry) confirmed entropy growth had slowed
+substantially (a real, partial win) but `mean_reward_this_update` was STILL pinned in the
+same ~0.032-0.034 band as every prior run, regardless of entropy dynamics -- three
+different configurations now landing in that same narrow range. That ruled entropy out as
+the explanation for flat reward specifically. Rather than run a fourth expensive experiment
+to gather more of the same evidence, read `prism/morl/utility_functions.py` (`f_k`, the
+function `R_t = gamma^{-t} * (f_k(z_{t+1}) - f_k(z_t))` is computed from) directly, and found
+a concrete, quantifiable root cause -- no GPU/nuPlan needed to find or verify it.
+
+`UtilityFunction.forward()` first min-max normalises `z` using `_min_val`/`_max_val`, running
+statistics that track the full range of `z` ever observed (updated on EVERY call, not just
+during training). Since every episode starts at `z=0` and grows to roughly 50-80 per
+dimension by the end, this range spans the full cumulative episode scale. A single
+timestep's contribution to `z` (~0.1-1, one step's style reward) is therefore always a tiny
+fraction of that range, at every point in every episode -- so the monotone neural network,
+operating on this heavily-squashed input, barely reacts to what happened on any single step,
+regardless of the step's actual quality.
+
+`forward()` also adds `linear_term = lamda * z.mean(dim=-1)` -- per its own comment, "to keep
+gradient non-zero," i.e. a small safety net for exactly this squashing scenario. But it uses
+a **plain, unweighted mean** across all 4 style dimensions, not each policy's own preference
+weights `w_k`. An offline check (`init_utility_functions_from_preferences`, simulating a
+realistic 150-step episode, zero GPU/nuPlan dependency) confirmed both parts precisely:
+`mean |R_t| = 0.030` -- matching the real training runs' ~0.032-0.034 almost exactly -- and
+**99.4-99.5% of the total signal came from that unweighted linear term alone**, not the
+neural pathway. A comfort-preferring and a progress-preferring policy got near-identical
+mean `|R_t|` (0.03016 vs 0.03017). The "safety net" had quietly become nearly the entire
+reward signal, and it doesn't know or care which policy it's training.
+
+### Changes
+
+**1. Preference-weighted linear term** (`prism/morl/utility_functions.py`) -- new
+   `_pref_weights` buffer (registered alongside the existing `_min_val`/`_max_val`, so it's
+   part of `state_dict()` and round-trips through checkpoint save/load automatically, no
+   extra plumbing needed at the two call sites in `scripts/train.py` that load a saved
+   utility function). Defaults to uniform (`ones(reward_dim)/reward_dim`, mathematically
+   identical to the old `z.mean()` -- exact backward compatibility until set). New
+   `set_preference(pref)` method. `forward()`'s `linear_term` changed from
+   `lamda * z.mean(dim=-1)` to `lamda * (z * self._pref_weights).sum(dim=-1)` --  a convex
+   combination either way (both existing preference vectors and the uniform default sum to
+   1), so this is a scale-neutral swap, not a magnitude change: same contribution size,
+   correctly weighted per-policy instead of generically averaged.
+   `init_utility_functions_from_preferences()` now calls `uf.set_preference(pref)` for each
+   policy (previously only used `pref` to bias `fc_in`'s weights).
+
+**2. `max_weight` raised 0.1 → 1.0** (`UtilityFunction.__init__` default) -- the neural
+   pathway's weights are clamped to `[0, max_weight]` after every optimizer step
+   (`make_monotone()`) to preserve monotonicity (non-negative weights => output
+   non-decreasing in each `z_i`); 0.1 was too small for the network to contribute a
+   meaningful signal on top of the (now correctly preference-weighted, but still only a
+   linear proxy) fallback term. Not threaded through `cfg`/YAML -- changed at the class
+   default level, affecting all current call sites uniformly, matching how other defaults in
+   this module were already handled before any config-level tuning was added.
+
+**3. `tests/test_utility_functions.py`** (new, 7 tests) -- `set_preference()` behavior
+   (default uniform, updates the buffer, rejects wrong shapes, survives a state_dict
+   round-trip); the linear term itself is preference-weighted (isolated from the neural
+   pathway); end-to-end, a comfort-preferring and progress-preferring policy value a boost
+   to their own dimension more than the other's; monotonicity still holds after the
+   `max_weight` change. Two of these initially failed for an instructive reason: `_min_val`/
+   `_max_val` update on every forward call (train or eval), so a naive sequence of calls
+   with different `z` shifts the normalization mid-comparison and isn't a fair
+   before/after check -- fixed by pinning them to a realistic fixed range before comparing
+   (the regime training settles into once enough episodes have shown the achievable range).
+   Worth flagging as a secondary, smaller observation for later: this means the
+   normalization is a genuine moving target for the ENTIRE run, not just early on, similar
+   in spirit to `nu`'s moving-target issue on the cost side -- likely much less severe since
+   the range plausibly saturates fairly quickly, but not verified, and not addressed here.
+
+### Verification
+
+- `python -m pytest tests/` -- 55/55 passing (48 previous + 7 new).
+- Offline diagnostic (no GPU/nuPlan): after the fix, the linear term's share of the total
+  signal dropped from >99% to ~56-61% (the neural pathway now contributes meaningfully).
+  Direct, controlled check (fixed `z`, boost one dimension by exactly 1.0, fixed
+  normalization range): the comfort-preferring policy valued a +1 comfort boost ~3.5x more
+  than a +1 progress boost; the progress-preferring policy showed the mirror-opposite ratio.
+  This is the differentiation that was completely absent before.
+- Full trainer smoke test (fake CaRL policy + fake env) with the real
+  `init_utility_functions_from_preferences()` path: completed without crashing, all
+  diagnostic histories finite.
+
+### Outstanding
+
+- [ ] Restart `make train-dpmorl-only-mini` (K=2, log_std clamp, ent_coef=0.0, and now this
+      fix) and check with `scripts/analyze_metrics.py`: does `mean_reward_this_update`
+      finally show real, sustained movement, and do the two policies' `z_*` trends diverge
+      more clearly than before?
+- [ ] If reward improves and styles diverge: proceed to the warm-start/safety-combination
+      step from the earlier plan (scale back to K=4 first).
+- [ ] If reward is STILL flat even now: the remaining ~40-44% neural-pathway share may still
+      not be enough, or the moving-normalization-range issue noted above may be more
+      significant than assumed -- worth deliberately verifying rather than guessing further.
+- [ ] The moving min/max normalization range (noted above) is unaddressed -- revisit if the
+      above still doesn't resolve things.
+- [ ] Everything else from the prior entries' Outstanding sections still applies.

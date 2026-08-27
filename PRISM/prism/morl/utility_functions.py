@@ -49,7 +49,7 @@ class UtilityFunction(nn.Module):
         reward_dim: int = 4,
         n_hidden: int = 24,
         n_layers: int = 3,
-        max_weight: float = 0.1,
+        max_weight: float = 1.0,
         lamda: float = 0.05,
     ) -> None:
         super().__init__()
@@ -75,6 +75,13 @@ class UtilityFunction(nn.Module):
         # Running min/max for normalisation (not backpropd)
         self.register_buffer("_min_val", torch.full((reward_dim,), float("inf")))
         self.register_buffer("_max_val", torch.full((reward_dim,), float("-inf")))
+
+        # Preference weights for the linear regularisation term (see
+        # forward()). Defaults to uniform (equivalent to the old z.mean()
+        # behavior) until set_preference() is called with this policy's
+        # actual w_k -- part of state_dict(), so saved/restored automatically
+        # by checkpoint load/save, no separate plumbing needed there.
+        self.register_buffer("_pref_weights", torch.ones(reward_dim) / reward_dim)
 
         self._init_positive()
         self.make_monotone()
@@ -110,8 +117,20 @@ class UtilityFunction(nn.Module):
         x = self._triple_clamp(x)
         x = self.fc_out(x)  # (B, 1)
 
-        # Linear regularisation: add lamda * mean(z) to keep gradient non-zero
-        linear_term = self._lamda * z.mean(dim=-1, keepdim=True)
+        # Linear regularisation: add lamda * (pref_weights . z) to keep
+        # gradient non-zero -- preference-WEIGHTED (not a plain mean), so
+        # this fallback term differentiates between policies instead of
+        # applying the same generic "grow every objective equally"
+        # incentive to all of them. In practice this term dominates the
+        # observed reward signal (>99% in an offline check) because the
+        # neural pathway above is structurally desensitized: it operates on
+        # z after min-max normalisation by the running min/max seen so far,
+        # which spans the full cumulative episode range (~0 to ~80) -- a
+        # single timestep's change in z is tiny by comparison, so the
+        # network barely reacts to it regardless of what happened that
+        # step. Getting this term right therefore matters far more than
+        # its "regularisation" name implies. See CHANGES.md.
+        linear_term = self._lamda * (z * self._pref_weights).sum(dim=-1, keepdim=True)
         out = x + linear_term  # (B, 1)
 
         if squeeze:
@@ -136,6 +155,21 @@ class UtilityFunction(nn.Module):
             self.eval()
             return self.__call_numpy(z)
         return _fn
+
+    def set_preference(self, pref: Sequence[float]) -> None:
+        """
+        Set this policy's preference vector, used to weight the linear
+        regularisation term in forward() (see the note there). Does NOT
+        affect monotonicity or the neural pathway -- only which combination
+        of z components the (in practice dominant) fallback linear term
+        rewards. `pref` need not sum to 1 (not enforced, matching how w_k
+        is used elsewhere in this codebase).
+        """
+        pref_t = torch.as_tensor(pref, dtype=torch.float32, device=self._pref_weights.device)
+        assert pref_t.shape == self._pref_weights.shape, (
+            f"preference vector must have shape ({self._reward_dim},), got {tuple(pref_t.shape)}"
+        )
+        self._pref_weights.copy_(pref_t)
 
     # ------------------------------------------------------------------
     # Monotonicity enforcement
@@ -299,6 +333,7 @@ def init_utility_functions_from_preferences(
     for pref in preference_vectors:
         uf = UtilityFunction(reward_dim=reward_dim)
         uf.to(device)
+        uf.set_preference(pref)
         # Bias fc_in weights toward the preference direction
         with torch.no_grad():
             w = uf.fc_in.weight.data  # (n_hidden, reward_dim)
