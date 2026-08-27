@@ -57,11 +57,16 @@ def compute_progress(
     # Floor at 0.01 so r_progress never reaches exactly 0 (CLAUDE.md: always in (0,1]).
     r_accel = max(0.01, 1.0 - math.exp(-abs(a_ego) / max(gamma_a, 1e-6)))
 
-    # Lane position sub-reward (leftmost lane = 0, rightmost = N_lanes - 1)
+    # Lane position sub-reward (leftmost lane = 0, rightmost = N_lanes - 1).
+    # Per the paper (docs/prism_paper_v2.tex, eq. progress): leftmost
+    # (fastest) lane scores 1, rightmost scores 0 -- this was previously
+    # inverted (lane_index / (n_lanes-1) instead of 1 - that), rewarding
+    # the rightmost/slowest lane instead of the intended leftmost/fastest
+    # one. Fixed; see CHANGES.md.
     if n_lanes <= 1:
         r_lane = 0.5  # neutral when there is no lane choice
     else:
-        r_lane = float(lane_index) / float(n_lanes - 1)
+        r_lane = 1.0 - float(lane_index) / float(n_lanes - 1)
 
     return float(r_speed * r_accel * (0.5 + 0.5 * r_lane))
 
@@ -162,7 +167,15 @@ def compute_style_rewards(
     r_lateral = compute_lateral_discipline(
         d_lat=d_lat,
         delta_psi=delta_psi,
-        sigma_d=hp.get("floor_values", {}).get("delta_d", 0.2),
+        # Was hp["floor_values"]["delta_d"] -- the wrong key. That's delta_d
+        # (the ADDITIVE FLOOR, 0.3, hardcoded directly in
+        # compute_lateral_discipline's formula below), not sigma_d (the
+        # Gaussian WIDTH, a separate, properly-calibrated/cited value under
+        # reward_scaling per compute_hyperparams.py and the paper). In
+        # production this silently fed sigma_d=0.3 instead of the intended,
+        # cited 0.2 -- the test fixture's floor_values.delta_d happened to
+        # already equal 0.2, masking the wrong-key read. See CHANGES.md.
+        sigma_d=scaling["sigma_d"],
         phi=scaling["phi"],
     )
     ttc = compute_ttc(d_lead=d_lead, v_ego=v_ego, v_lead=v_lead, has_lead=has_lead)

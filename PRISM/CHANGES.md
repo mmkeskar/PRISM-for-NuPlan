@@ -983,3 +983,70 @@ reward signal, and it doesn't know or care which policy it's training.
 - [ ] The moving min/max normalization range (noted above) is unaddressed -- revisit if the
       above still doesn't resolve things.
 - [ ] Everything else from the prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-08-27 (cont.) — Two confirmed style-reward bugs, found by auditing against the paper
+
+### Motivation
+
+Before restarting training on the utility-function fix, audited `prism/env/rewards.py`
+against `docs/prism_paper_v2.tex`'s formal spec (eq. progress, eq. lateral) rather than
+running another experiment to find out empirically. Found two real, confirmed
+implementation-vs-spec mismatches.
+
+### Changes
+
+**1. `r_lane` direction was inverted** (`prism/env/rewards.py::compute_progress`). The paper
+   states explicitly: "Leftmost (fastest) lane scores 1; rightmost scores 0." The code
+   computed `r_lane = lane_index / (n_lanes - 1)` with `lane_index=0` = leftmost (per its own
+   comment) -- meaning `r_lane` was HIGHEST at the rightmost lane and LOWEST at the leftmost,
+   the exact opposite of spec. Fixed to `r_lane = 1.0 - lane_index / (n_lanes - 1)`.
+   `tests/test_rewards.py::test_single_lane_neutral_r_lane` was asserting the old (buggy)
+   direction and has been corrected to match the paper.
+
+**2. `sigma_d` read from the wrong hyperparameter key** (`prism/env/rewards.py::compute_style_rewards`).
+   The paper defines two DISTINCT constants for lateral discipline: `sigma_d=0.2` (Gaussian
+   width, from empirical lane-keeping data, cited) and `delta_d=0.3` (the additive floor,
+   separately hardcoded in `compute_lateral_discipline`'s formula, preventing lane-change
+   maneuvers from being over-penalized). `compute_hyperparams.py` correctly produces both
+   under their own keys (`reward_scaling.sigma_d` and `floor_values.delta_d` respectively) --
+   but `compute_style_rewards` was reading `hp["floor_values"]["delta_d"]` and passing it as
+   `sigma_d`, silently using 0.3 instead of the intended, cited 0.2 in production. The test
+   fixture's `floor_values.delta_d` happened to already be 0.2, masking the wrong-key read --
+   `default_hp` now deliberately keeps `reward_scaling.sigma_d=0.2` and
+   `floor_values.delta_d=0.3` different (matching real `compute_hyperparams.py` output), and
+   a new regression test (`test_uses_reward_scaling_sigma_d_not_floor_delta_d`) checks
+   `compute_style_rewards`'s output against a direct `compute_lateral_discipline` call using
+   the correct key, so this can't silently regress again. Also fixed the same missing-key
+   issue in `scripts/explore_simulator.py`'s placeholder hyperparams dict (would have raised
+   `KeyError` on `scaling["sigma_d"]` once the direct-index read landed).
+
+**Not changed, flagged as an intentional design property worth being aware of:** `r_accel`
+(part of `r_progress`) uses `1 - exp(-|a_ego|/gamma_a)` -- rewards acceleration MAGNITUDE in
+either direction (speeding up or braking), explicitly per the paper ("Magnitude captures
+both assertive acceleration and decisive braking," cited to Surmann2025), not "is the car
+moving." This means a policy cruising smoothly at exactly the desired speed (`a_ego≈0`)
+scores near `r_accel`'s floor (0.01) on this sub-term specifically, in real tension with
+`r_comfort`'s jerk-minimization goal. This is deliberate per the citation, not a bug -- but
+worth keeping in mind when interpreting results, since it means `r_progress` can be
+structurally small during otherwise-ideal driving, and the personalization axis between
+"comfort" and "progress" preferences may partly reflect this designed-in tension rather than
+being purely orthogonal.
+
+### Verification
+
+- `python -m pytest tests/` -- 56/56 passing (55 previous + 1 new regression test; 1 existing
+  test corrected to match the fixed lane direction).
+- Confirmed via direct code read (not simulation) against `compute_hyperparams.py`'s actual
+  output structure (`reward_scaling.sigma_d=0.2`, `floor_values.delta_d=0.3` in the real,
+  non-test-fixture bootstrap/output hyperparams) that the sigma_d bug is real in production,
+  not just a test-fixture artifact.
+- Grepped the full repo for other `floor_values`/`delta_d`/`lane_index` usages to confirm no
+  other call site depends on the old (buggy) behavior.
+
+### Outstanding
+
+- [ ] Both fixes apply automatically to the next training run (no config change needed) --
+      restart `make train-dpmorl-only-mini` with all fixes from today's entries in place.
+- [ ] Everything else from today's earlier entries' Outstanding sections still applies.

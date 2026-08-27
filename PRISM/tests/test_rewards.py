@@ -33,6 +33,11 @@ from prism.curriculum.alpha_schedule import AlphaSchedule, compute_alpha
 
 @pytest.fixture
 def default_hp():
+    # sigma_d (reward_scaling) and delta_d (floor_values) deliberately kept
+    # DIFFERENT (0.2 vs 0.3, matching real compute_hyperparams.py output) --
+    # equal values previously masked a wrong-key bug where
+    # compute_style_rewards read delta_d and used it as sigma_d. See
+    # CHANGES.md and TestStyleRewardVector.test_uses_reward_scaling_sigma_d_not_floor_delta_d.
     return {
         "reward_scaling": {
             "sigma_j_sq": 1.0,
@@ -40,8 +45,9 @@ def default_hp():
             "gamma_a": 1.0,
             "phi": 0.3,
             "tau": 2.0,
+            "sigma_d": 0.2,
         },
-        "floor_values": {"delta_d": 0.2},
+        "floor_values": {"delta_d": 0.3, "delta_s": 0.2},
         "alpha_curriculum": {"alpha_start": 0.20, "alpha_end": 0.95},
     }
 
@@ -106,11 +112,13 @@ class TestProgress:
     def test_single_lane_neutral_r_lane(self):
         # Single lane: r_lane = 0.5
         r1 = compute_progress(10, 10, 2, lane_index=0, n_lanes=1, beta=0.5, gamma_a=1.0)
-        # Two lanes, ego in middle: r_lane = lane_index / (n_lanes - 1)
+        # Two lanes: r_lane = 1 - lane_index / (n_lanes - 1). lane_index=0 is
+        # leftmost (fastest lane) per the paper (docs/prism_paper_v2.tex,
+        # eq. progress: "leftmost (fastest) lane scores 1, rightmost scores
+        # 0") -- so lane_index=0 must score HIGHEST, not lowest.
         r2_left  = compute_progress(10, 10, 2, lane_index=0, n_lanes=2, beta=0.5, gamma_a=1.0)
         r2_right = compute_progress(10, 10, 2, lane_index=1, n_lanes=2, beta=0.5, gamma_a=1.0)
-        # r_lane=0.5 for n_lanes=1, r_lane=0 and 1 for n_lanes=2
-        assert r2_left < r1 < r2_right
+        assert r2_right < r1 < r2_left
 
     def test_at_desired_speed_no_speed_penalty(self):
         # When v_ego == v_des, shortfall = 0, r_speed = 1
@@ -218,6 +226,33 @@ class TestStyleRewardVector:
         )
         for i, val in enumerate(r):
             assert 0.0 < val <= 1.0, f"Component {i} = {val} out of (0,1]"
+
+    def test_uses_reward_scaling_sigma_d_not_floor_delta_d(self, default_hp):
+        """Regression test: compute_style_rewards's r_lateral must use
+        hp["reward_scaling"]["sigma_d"] (0.2 in the fixture, matching real
+        compute_hyperparams.py output) for the Gaussian width, NOT
+        hp["floor_values"]["delta_d"] (0.3 in the fixture -- a different
+        constant, the additive floor hardcoded inside
+        compute_lateral_discipline itself). The fixture deliberately keeps
+        these different so this test fails loudly if the wrong key is ever
+        read again."""
+        r_direct = compute_lateral_discipline(
+            d_lat=0.15, delta_psi=0.0,
+            sigma_d=default_hp["reward_scaling"]["sigma_d"],
+            phi=default_hp["reward_scaling"]["phi"],
+        )
+        r_vec = compute_style_rewards(
+            j_lon=0.0, j_lat=0.0,
+            v_ego=10.0, v_des=10.0, a_ego=1.0,
+            lane_index=0, n_lanes=1,
+            d_lat=0.15, delta_psi=0.0,
+            d_lead=50.0, v_lead=0.0, has_lead=False,
+            hp=default_hp,
+        )
+        assert r_vec[2] == pytest.approx(r_direct, rel=1e-6), (
+            "r_lateral does not match the value computed with "
+            "reward_scaling.sigma_d -- check which hp key compute_style_rewards reads"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
