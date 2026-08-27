@@ -63,7 +63,15 @@ stage1:
   diversity_weight: 1.0
 
 stage2:
-  n_updates: 10000
+  # 10000 -> 5000: at ~7.25s/update this run was heading for ~20h; the
+  # utility-function-fix run already shows a clear, stable pattern by
+  # update 1200 (entropy decreasing, reward plateaued, outcomes still
+  # improving), so 5000 gives ample margin without doubling wall-clock for
+  # little expected new signal. No cost/safety machinery is active in this
+  # config (beta=0), so this doesn't carry the same late-onset-surprise
+  # risk the safety-cost run showed (its dip-then-rise was specific to the
+  # cost critic's dynamics, not present here).
+  n_updates: 5000
   steps_per_update: 512
   update_epochs: 4
   minibatch_size: 64
