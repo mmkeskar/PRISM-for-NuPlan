@@ -828,3 +828,55 @@ entropy logging and was never restarted), but a consistent, plausible mechanism.
       instability-analysis (safety-cost) run is restarted with current code, to see whether
       entropy behaves the same way there and whether it correlates with the
       updates-1300-3260 episode-termination burst as hypothesized above.
+
+---
+
+## 2026-08-26 (cont.) — ent_coef 0.01 → 0.0: clamp bounded the symptom, didn't fix the cause
+
+### Motivation
+
+The K=2 + log_std-clamp run above was allowed to continue past the first 263 updates
+covered in the previous entry. At 2347 updates, `entropy` had climbed nearly every single
+bin (2.07 -> 4.51), approaching the clamp's theoretical ceiling (~4.84 for this 2D action
+space) rather than plateauing before reaching it -- the clamp bounded the worst case but
+did not address why entropy keeps climbing. Meanwhile `v_loss` genuinely improved
+(0.035 -> ~0.010-0.014) and episode outcomes genuinely improved (`frac_completed` 49% ->
+82%, collision rate 34% -> 11%), but `mean_reward_this_update` stayed completely flat
+(0.031-0.034) the entire run. Read together: real learning is visibly happening (critic,
+survival/completion), but the actor's own reward score never moves, while its actions get
+steadily noisier -- consistent with the entropy bonus (`-ent_coef * entropy` in the PPO
+loss) being effectively unopposed the whole run, not just early on, per the mechanism in
+the previous two entries (ppo_loss's gradient contribution to log_std is structurally weak
+under per-minibatch advantage normalization).
+
+### Change
+
+`ent_coef: 0.01 -> 0.0` in `configs/prism_dpmorl_only.yaml`'s `stage2` block (config-only,
+no code change -- `ent_coef` was already trainer-config-driven). Zero chosen deliberately
+over a smaller-but-nonzero value: it's the cleanest test of the exact hypothesis above (if
+entropy still climbs with the pull fully removed, something else entirely is driving it,
+cleanly falsifying this theory; if it stabilizes, the theory is confirmed) -- a smaller
+value would give a muddier signal either way. Also matches common practice: several
+well-known PPO implementations default entropy coefficient to 0.0 specifically for
+continuous-action control, relying on the Gaussian action distribution's own sampling
+noise for exploration rather than an explicit bonus (unlike discrete-action settings, where
+an entropy bonus is more commonly needed to prevent premature deterministic collapse).
+
+### Verification
+
+Config-only change; confirmed `configs/prism_dpmorl_only.yaml` parses with
+`stage2.ent_coef == 0.0`. No code touched, so the existing 48/48 test suite is unaffected
+(not re-run for this entry specifically since nothing it covers changed).
+
+### Outstanding
+
+- [ ] Restart `make train-dpmorl-only-mini` with `ent_coef=0.0`; watch whether entropy
+      plateaus/decreases this time, and whether `mean_reward_this_update` finally shows
+      sustained movement instead of sitting flat at ~0.033.
+- [ ] If entropy stabilizes and reward improves: hypothesis confirmed -- consider whether
+      some small nonzero floor is worth reintroducing later (e.g. if entropy collapses too
+      fast / policy converges prematurely), but only after seeing this run's behavior.
+- [ ] If entropy STILL climbs with ent_coef=0.0: the entropy bonus was not the (sole)
+      driver -- look elsewhere (e.g. the log_prob/ratio computation's own gradient
+      contribution to log_std, or the advantage-normalization mechanism itself).
+- [ ] Everything else from the prior two entries' Outstanding sections still applies.

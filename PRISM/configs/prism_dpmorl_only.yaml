@@ -34,6 +34,12 @@
 # Also includes the log_std clamp fix (prism/models/common/action_heads.py)
 # from the previous run's real finding: entropy climbed monotonically for
 # 1600+ updates with flat reward, traced to log_std having no upper bound.
+#
+# ent_coef reduced 0.01 -> 0.0 (see stage2 block below) after a follow-up
+# run with the clamp in place STILL showed entropy climbing almost every
+# bin for 2300+ updates, approaching the clamp ceiling rather than
+# plateauing -- the clamp bounded the damage but didn't address why it
+# keeps climbing. See CHANGES.md.
 
 # ── Experiment ───────────────────────────────────────────────────────────────
 experiment_name: prism_dpmorl_only_001
@@ -63,7 +69,19 @@ stage2:
   minibatch_size: 64
   clip_coef: 0.2
   vf_coef: 0.5
-  ent_coef: 0.01
+  # 0.01 -> 0.0. Real run data: entropy climbed almost every single bin for
+  # 2300+ updates, approaching the log_std clamp ceiling (~4.84) rather than
+  # plateauing on its own -- the entropy bonus's constant pull toward higher
+  # entropy appears effectively unopposed (ppo_loss's gradient contribution
+  # to log_std is structurally weak, per-minibatch advantage normalization),
+  # while reward stayed flat despite the critic and episode-outcome metrics
+  # both genuinely improving. Zero (not just a smaller value) chosen
+  # deliberately as the cleanest test of that exact hypothesis, and matches
+  # common practice for continuous-action PPO (several well-known
+  # implementations default entropy coefficient to 0.0 for continuous
+  # control, relying on the Gaussian's own sampling noise for exploration).
+  # See CHANGES.md.
+  ent_coef: 0.0
   max_grad_norm: 0.5
   gae_lambda: 0.95
   learning_rate: 3.0e-4
