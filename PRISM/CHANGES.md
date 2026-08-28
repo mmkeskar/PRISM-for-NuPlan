@@ -1108,3 +1108,12 @@ wait
       `_build_agent()` call constructs a fresh network, no backbone sharing across policies)
       -- unrelated to this change, noted here only because it came up while reading this code
       path; a shared-backbone design would be a much bigger change, out of scope for now.
+
+`make train-dpmorl-only-mini-parallel` added (`Makefile`): wraps the `--policy_ids` workflow
+above -- runs Stage 1 once, then launches `N_POLICIES` (auto-detected from
+`configs/prism_dpmorl_only.yaml`'s `n_policies`, overridable on the CLI) concurrent
+background processes via a shell `for`/`wait` loop, one per `policy_id`, each with its
+stdout/stderr redirected to its own `runs/dpmorl_only/policy_{k}.log` (concurrent processes
+writing to one terminal would otherwise interleave). Verified with `make -n` dry-runs at both
+the auto-detected K=2 and an `N_POLICIES=1` override (including singular/plural wording in
+the echo lines) -- not run for real (needs the lab machine's nuPlan/CaRL environment).

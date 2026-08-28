@@ -34,7 +34,7 @@ PYTHON            := python
 
 .PHONY: all setup check-env check cache cache-mini hyperparams hyperparams-mini \
         check-hyperparams train train-mini train-instability-mini train-dpmorl-only-mini \
-        test clean help
+        train-dpmorl-only-mini-parallel test clean help
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default target
@@ -55,6 +55,7 @@ help:
 	@echo "  make train-mini         Smoke-test training on mini dataset"
 	@echo "  make train-instability-mini  Instability-analysis experiment (mini dataset)"
 	@echo "  make train-dpmorl-only-mini  DPMORL-only experiment, safety off (mini dataset)"
+	@echo "  make train-dpmorl-only-mini-parallel  Same, K policies as concurrent processes"
 	@echo "  make cache              Build cache from full train dataset"
 	@echo "  make hyperparams        Compute hyperparams (full, 200 rollouts)"
 	@echo "  make train              Full PRISM training run"
@@ -218,6 +219,47 @@ train-dpmorl-only-mini:
 	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
 	    --cache_path  $(MINI_CACHE_PATH) \
 	    --output_dir  runs/dpmorl_only
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training — DPMORL-only experiment, K policies as concurrent processes.
+# Real wall-clock parallelism (separate OS processes/CPU cores), not matrix
+# batching -- see --policy_ids's help text and CHANGES.md for why. Runs
+# Stage 1 once (saves utility functions), then launches one process per
+# policy_id in the background, each restricted to its own index, and waits
+# for all of them. Per-policy stdout/stderr goes to its own log file since
+# concurrent processes writing to one terminal would interleave.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Auto-detected from the config so this can't silently drift out of sync;
+# override on the CLI if you want fewer than the config's full K, e.g.
+# `make train-dpmorl-only-mini-parallel N_POLICIES=1`.
+N_POLICIES ?= $(shell $(PYTHON) -c "import yaml; print(yaml.safe_load(open('configs/prism_dpmorl_only.yaml'))['n_policies'])")
+DPMORL_ONLY_OUT := runs/dpmorl_only
+DPMORL_ONLY_EXP := prism_dpmorl_only_001
+
+train-dpmorl-only-mini-parallel:
+	@echo "── DPMORL-only experiment: Stage 1, then $(N_POLICIES) polic$(if $(filter 1,$(N_POLICIES)),y,ies) as concurrent processes ──"
+	$(PYTHON) scripts/train.py \
+	    --config     configs/prism_dpmorl_only.yaml \
+	    --hyperparams hyperparams.json \
+	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
+	    --cache_path  $(MINI_CACHE_PATH) \
+	    --output_dir  $(DPMORL_ONLY_OUT) \
+	    --stage1_only
+	@echo "── Stage 1 done. Launching policy_ids 0..$$(($(N_POLICIES)-1)) concurrently -- logs in $(DPMORL_ONLY_OUT)/policy_*.log ──"
+	@for k in $$(seq 0 $$(($(N_POLICIES)-1))); do \
+	    $(PYTHON) scripts/train.py \
+	        --config     configs/prism_dpmorl_only.yaml \
+	        --hyperparams hyperparams.json \
+	        --nuplan_data_root $(NUPLAN_MINI_ROOT) \
+	        --cache_path  $(MINI_CACHE_PATH) \
+	        --output_dir  $(DPMORL_ONLY_OUT) \
+	        --skip_stage1 \
+	        --utility_fn_dir $(DPMORL_ONLY_OUT)/$(DPMORL_ONLY_EXP)/stage1 \
+	        --policy_ids $$k > $(DPMORL_ONLY_OUT)/policy_$$k.log 2>&1 & \
+	done; \
+	wait; \
+	echo "── All $(N_POLICIES) polic$(if $(filter 1,$(N_POLICIES)),y,ies) finished. Metrics in $(DPMORL_ONLY_OUT)/$(DPMORL_ONLY_EXP)/policy_*/  ──"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training — full run
