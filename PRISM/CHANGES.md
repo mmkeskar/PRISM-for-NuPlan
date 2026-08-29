@@ -1192,3 +1192,72 @@ phenomenon):
 - [ ] `ent_coef=0.001` and `normalization_warmup_calls=50000` are both reasoned starting
       points, not calibrated values -- revisit based on what this run shows.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-08-29 (cont.) — `scripts/inspect_utility_functions.py`: is divergence in the weights, not just the behavior?
+
+### Motivation
+
+Asked to judge personalization directly from the two policies' utility-function WEIGHTS
+rather than inferring it from z_T trajectories, which are confounded by training stability,
+exploration noise, and episode randomness -- exactly the things the last several entries have
+been fighting. Worth noting explicitly: in "preferences" mode (what every run so far has
+used), the utility function's neural network weights are never updated during Stage 2 at all
+-- `run_stage2()`'s optimizer is built only from `agent.trainable_parameters()`, and every
+call to `utility_fn` from `PRISMEnv.step()` goes through `as_callable()`, which wraps it in
+`torch.no_grad()`. So the utility functions are fixed at whatever
+`init_utility_functions_from_preferences()` set them to at construction, and checking their
+weights is checking whether that ONE-TIME construction actually took hold -- independent of
+anything that happened during RL training.
+
+### Change
+
+New `scripts/inspect_utility_functions.py` -- loads saved `utility_fn_{k}.pth` checkpoints
+(needs the `prism` package + torch, run from the repo root in the training conda env, unlike
+the stdlib-only `analyze_metrics.py`) and reports: whether `_pref_weights` matches the
+declared preference; `fc_in.weight`'s per-dimension mean magnitude (which dimension the first
+layer emphasizes); and a direct sensitivity test -- hold `z` fixed, boost one dimension by
++1.0 at a time, check whether each checkpoint's OWN preferred dimension produces the largest
+utility gain. Preferences are inferred from checkpoint position using the standard K<=4
+convention (`scripts/train.py`'s `_get_preference_vectors`) or can be given explicitly via
+`path:w1,w2,w3,w4`.
+
+Two things caught while building and smoke-testing this against locally-constructed
+checkpoints (not yet the user's real ones):
+- The existing checkpoint the user has predates the normalization-freeze fix (this session's
+  earlier entry) and won't have the `_calls_seen` buffer -- `load_state_dict` now uses
+  `strict=False` so this doesn't crash, with a printed note when keys are missing.
+- The sensitivity test's own sequential `fn()` calls were themselves shifting
+  `_min_val`/`_max_val` between the base and boosted evaluations on a checkpoint with
+  `_calls_seen` below the freeze threshold -- the exact moving-target problem this whole
+  investigation started from, now self-inflicted inside the diagnostic tool meant to check
+  for it. Fixed by pinning the normalization range (freezing `_calls_seen` to the warmup
+  threshold, or falling back to a fixed `[0, 50]` range if the checkpoint's stats were still
+  `inf`/`-inf`, i.e. never saw a real value) immediately after loading, before running the
+  test -- confirmed via a before/after smoke-test comparison that this removes spurious
+  negative "utility gain" values the unpinned version produced.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing (no test-suite code touched).
+- Smoke-tested against two locally-constructed (not the user's real) checkpoints built via
+  `init_utility_functions_from_preferences`: `_pref_weights` correctly matched the declared
+  preference for both; the sensitivity test correctly showed each checkpoint's own preferred
+  dimension producing the largest gain, with the pinning fix removing spurious negative gains
+  present in an earlier, unpinned version of the same test.
+- Not yet run against the user's actual saved checkpoints from the completed 5000-update run
+  -- next step.
+
+### Outstanding
+
+- [ ] Run against the real checkpoints:
+      `python scripts/inspect_utility_functions.py runs/dpmorl_only/prism_dpmorl_only_001/stage1/utility_fn_0.pth runs/dpmorl_only/prism_dpmorl_only_001/stage1/utility_fn_1.pth`
+- [ ] If both show their own preferred dimension winning: divergence exists at the utility-
+      function level -- any remaining lack of z_T divergence in behavior is downstream (actor
+      not exploiting the signal, or training instability), not because the utility functions
+      themselves are the same.
+- [ ] If not: a real problem at the utility-function level specifically, worth investigating
+      before anything else (e.g. whether `max_weight`/preference-biasing at construction is
+      actually producing enough separation, independent of training).
+- [ ] Everything else from prior entries' Outstanding sections still applies.
