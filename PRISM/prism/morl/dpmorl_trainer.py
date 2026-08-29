@@ -176,6 +176,17 @@ class DPMORLTrainer:
         self.policy_id = policy_id
         self.agent = agent
         self.optimizer = optimizer
+        # Linear LR decay to 0 over the run (standard PPO practice, e.g. the
+        # original PPO paper / CleanRL's implementation) -- previously
+        # absent: lr stayed at its initial value for the entire run,
+        # including the final updates where large steps are least wanted.
+        # A late, still-full-sized update is a plausible contributor to the
+        # late-training instability seen in a real run (huge approx_kl spike
+        # in the final bin). Captured here (not read fresh each update) so
+        # it reflects whatever LR the optimizer was actually constructed
+        # with, matching cfg["stage2"]["learning_rate"].
+        self._initial_lr = optimizer.param_groups[0]["lr"]
+        self._lr_decay = cfg.get("lr_decay", True)
         self.env = env
         self.utility_fn = utility_fn
         self.hp = hp
@@ -290,6 +301,15 @@ class DPMORLTrainer:
     def _train_loop(self, n_updates: int, steps_per_update: int, next_obs, summary: Dict) -> None:
         for update in range(n_updates):
             update_start = time.time()
+
+            # Linear LR decay: 1.0 -> 0.0 fraction of initial_lr over the run.
+            if self._lr_decay:
+                frac = 1.0 - (update / max(n_updates, 1))
+                current_lr = self._initial_lr * frac
+                for pg in self.optimizer.param_groups:
+                    pg["lr"] = current_lr
+            else:
+                current_lr = self._initial_lr
 
             # Guard: alpha must never reach 1.0 (defense-in-depth -- neither
             # update_var nor compute_empirical_cvar currently divides by
@@ -516,6 +536,7 @@ class DPMORLTrainer:
                 "approx_kl": loss_info["approx_kl"],
                 "clip_fraction": loss_info["clip_fraction"],
                 "reward_advantage_std": loss_info["reward_advantage_std"],
+                "current_lr": current_lr,
                 "nan_detected": loss_info["nan_detected"],
                 "nan_streak": self._nan_streak,
                 "rollout_time_s": rollout_end - rollout_start,

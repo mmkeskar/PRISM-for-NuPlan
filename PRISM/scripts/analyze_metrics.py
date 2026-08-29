@@ -220,7 +220,8 @@ def report_run(label, cfg, ups, n_bins=10):
     for key, nd in [("cost_critic_loss", 4), ("cvar_hat", 3), ("v_loss", 4),
                      ("entropy", 3), ("approx_kl", 5), ("clip_fraction", 3),
                      ("mean_reward_this_update", 4), ("std_reward_this_update", 4),
-                     ("reward_advantage_std", 5), ("frac_completed", 3)]:
+                     ("reward_advantage_std", 5), ("frac_completed", 3),
+                     ("current_lr", 6)]:
         early, late = half_compare(ups, key)
         if early is None:
             continue

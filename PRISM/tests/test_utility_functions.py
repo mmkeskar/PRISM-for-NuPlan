@@ -144,3 +144,43 @@ class TestMonotonicity:
             assert fn(z_up) >= base - 1e-5, (
                 f"increasing z[{dim}] must not decrease utility (monotonicity violated)"
             )
+
+
+class TestNormalizationFreeze:
+    def test_freezes_after_warmup_calls(self):
+        """_min_val/_max_val must stop updating once normalization_warmup_calls
+        forward() calls have been seen -- previously updated forever, making
+        the same raw z normalise differently depending on when during
+        training it's evaluated (a moving target for the network)."""
+        import numpy as np
+        uf = UtilityFunction(reward_dim=4, normalization_warmup_calls=10)
+        uf.eval()
+        fn = uf.as_callable()
+
+        for i in range(5):
+            fn(np.array([float(i) * 10, 0.0, 0.0, 0.0], dtype=np.float32))
+        assert uf._calls_seen.item() == 5
+
+        for i in range(5, 20):
+            fn(np.array([float(i) * 10, 0.0, 0.0, 0.0], dtype=np.float32))
+        assert uf._calls_seen.item() == 10, "calls_seen must freeze at the warmup threshold"
+        assert uf._max_val[0].item() == 90.0, (
+            "max_val must reflect only calls up to the freeze point (call #9 -> 90), "
+            "not later calls that would have pushed it to 190"
+        )
+
+    def test_freeze_state_survives_state_dict_roundtrip(self):
+        """_calls_seen is a buffer -- must save/load with the checkpoint so a
+        resumed run doesn't silently re-open the normalization range."""
+        import numpy as np
+        uf = UtilityFunction(reward_dim=4, normalization_warmup_calls=3)
+        uf.eval()
+        fn = uf.as_callable()
+        for i in range(5):
+            fn(np.array([float(i), 0.0, 0.0, 0.0], dtype=np.float32))
+        assert uf._calls_seen.item() == 3
+
+        uf2 = UtilityFunction(reward_dim=4, normalization_warmup_calls=3)
+        uf2.load_state_dict(uf.state_dict())
+        assert uf2._calls_seen.item() == 3
+        assert torch.allclose(uf2._max_val, uf._max_val)

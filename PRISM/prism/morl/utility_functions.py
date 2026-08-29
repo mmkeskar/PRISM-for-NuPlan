@@ -51,12 +51,24 @@ class UtilityFunction(nn.Module):
         n_layers: int = 3,
         max_weight: float = 1.0,
         lamda: float = 0.05,
+        normalization_warmup_calls: int = 50_000,
     ) -> None:
         super().__init__()
         self._reward_dim = reward_dim
         self._n_hidden = n_hidden
         self._max_weight = max_weight
         self._lamda = lamda
+        # _min_val/_max_val (registered below) stop updating once this many
+        # forward() calls have been seen -- previously updated on EVERY
+        # call, forever, for the entire run (not just early on): the same
+        # raw z value gets normalised differently depending on WHEN during
+        # training it's evaluated, since the range it's divided by keeps
+        # growing. A moving target for the network to fit against the whole
+        # run, not just a warmup-period effect. ~50k calls is roughly
+        # 165-330 episodes (at ~150-300 calls/episode) -- enough to get a
+        # representative sense of the achievable range without waiting so
+        # long that most of a run still has it drifting. See CHANGES.md.
+        self._normalization_warmup_calls = normalization_warmup_calls
 
         # Input layer: reward_dim -> n_hidden
         self.input_bn = nn.BatchNorm1d(reward_dim, affine=False)
@@ -72,9 +84,13 @@ class UtilityFunction(nn.Module):
         # Output layer: n_hidden * 3 -> 1
         self.fc_out = nn.Linear(n_hidden * 3, 1)
 
-        # Running min/max for normalisation (not backpropd)
+        # Running min/max for normalisation (not backpropd). Frozen after
+        # _normalization_warmup_calls (see _update_running_stats) -- part of
+        # state_dict() like the other buffers here, so the freeze point
+        # (and whatever range was captured) survives checkpoint save/load.
         self.register_buffer("_min_val", torch.full((reward_dim,), float("inf")))
         self.register_buffer("_max_val", torch.full((reward_dim,), float("-inf")))
+        self.register_buffer("_calls_seen", torch.tensor(0, dtype=torch.long))
 
         # Preference weights for the linear regularisation term (see
         # forward()). Defaults to uniform (equivalent to the old z.mean()
@@ -202,8 +218,11 @@ class UtilityFunction(nn.Module):
         self.make_monotone()
 
     def _update_running_stats(self, z: torch.Tensor) -> None:
+        if self._calls_seen.item() >= self._normalization_warmup_calls:
+            return  # frozen -- normalization range stays stable for the rest of the run
         self._min_val = torch.minimum(self._min_val, z.min(0).values)
         self._max_val = torch.maximum(self._max_val, z.max(0).values)
+        self._calls_seen += z.shape[0]
 
     @staticmethod
     def _triple_clamp(x: torch.Tensor) -> torch.Tensor:

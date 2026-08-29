@@ -1117,3 +1117,78 @@ stdout/stderr redirected to its own `runs/dpmorl_only/policy_{k}.log` (concurren
 writing to one terminal would otherwise interleave). Verified with `make -n` dry-runs at both
 the auto-detected K=2 and an `N_POLICIES=1` override (including singular/plural wording in
 the echo lines) -- not run for real (needs the lab machine's nuPlan/CaRL environment).
+
+---
+
+## 2026-08-29 — Three bundled fixes for late-training instability
+
+### Motivation
+
+The K=2, full-5000-update run (both fixes from the previous two entries in place) told a
+different story than the 2000-update checkpoint had suggested: ALL FOUR z_T dimensions
+regressed by the end, for BOTH policies, not just `z_progress`. `policy_0`'s `approx_kl` hit
+54.4 in the final bin (4501-5000) -- an order of magnitude past anything seen in any prior
+run -- with `clip_fraction` climbing steadily the entire second half (0.082 -> 0.365).
+Cross-referencing the bins: entropy bottomed out and outcomes peaked around update 2500-3000
+for `policy_0`, then both reversed in the back half, culminating in that late spike. Three
+candidate mechanisms, bundled into one run rather than three separate ~10.6h runs given time
+cost, though each is independently well-motivated (not competing guesses for the same
+phenomenon):
+
+### Changes
+
+**1. Linear learning-rate decay** (`prism/morl/dpmorl_trainer.py`) -- `learning_rate` was
+   fixed at its initial value for the entire run, including the final updates, where a
+   still-full-sized step is least wanted. Standard PPO practice (original PPO paper, CleanRL,
+   etc.) linearly decays LR to 0 over the run; this codebase had no such schedule. Implemented
+   directly on `optimizer.param_groups` each update (`frac = 1 - update/n_updates`) rather
+   than via `torch.optim.lr_scheduler`, matching how e.g. CleanRL does it -- simpler to reason
+   about alongside the update-indexed loop already there. New `cfg["lr_decay"]` toggle
+   (default `True`); `current_lr` now logged every update. A late, still-large LR step is a
+   plausible direct contributor to the late approx_kl spike.
+
+**2. `ent_coef` 0.0 -> 0.001** (`configs/prism_dpmorl_only.yaml`) -- 0.0 fixed the *runaway*
+   entropy problem from two entries back, and entropy did decrease cleanly for ~2500 updates
+   -- but with literally no floor, nothing stops entropy from collapsing too low either, and
+   its lowest point lined up with roughly where the run started destabilizing. A fully
+   deterministic, over-confident policy is more brittle: less able to recover if something
+   else (e.g. still-high LR) perturbs it. 0.001 (10x smaller than the original problematic
+   0.01) is a reasoned starting point for a small floor, explicitly not a precisely calibrated
+   value -- may need further tuning based on what this run shows.
+
+**3. Frozen normalization range** (`prism/morl/utility_functions.py`) -- the "still-unfixed"
+   item flagged in the two prior entries. `_min_val`/`_max_val` previously updated on every
+   single `forward()` call, forever, for the entire run: the same raw `z` value gets
+   normalised differently depending on when during training it's evaluated, since the range
+   it's divided by keeps growing. A moving target the network never gets to settle against,
+   not just a warmup-period effect -- and one that could plausibly introduce an uneven jolt
+   at any point (any new record max shifts it), including late in a run when the policy is
+   otherwise stabilizing. New `normalization_warmup_calls` param (default 50,000 -- roughly
+   165-330 episodes, enough to get a representative range without leaving it open for most of
+   a run) and a `_calls_seen` buffer (survives checkpoint save/load); `_update_running_stats`
+   now no-ops once the threshold is reached.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing (56 previous + 2 new: normalization freezes at
+  the exact threshold and survives a state_dict round-trip).
+- Offline check (no GPU/nuPlan): forced calls past the warmup threshold, confirmed
+  `_calls_seen` and `_max_val` both stop changing exactly at the configured limit.
+- Trainer smoke test (fake CaRL policy + fake env): confirmed `current_lr` starts at the
+  configured value and decays monotonically to near-zero by the final update.
+- `scripts/analyze_metrics.py` updated to include `current_lr` in the directional-flags
+  section, so all three fixes have some visibility even bundled into one run.
+
+### Outstanding
+
+- [ ] Restart with all three fixes in place (plus everything from the prior entries). Given
+      they're bundled: if this run is healthy for the full 5000 updates, we won't know which
+      fix(es) mattered without follow-up runs reverting one at a time -- acceptable given the
+      time cost of isolating first, but worth remembering before overclaiming "X fixed it" in
+      any writeup.
+- [ ] If late-training instability recurs despite all three: reconsider the `r_progress`
+      multiplicative-AND-structure question from two entries back -- it was set aside in favor
+      of this broader fix, not ruled out.
+- [ ] `ent_coef=0.001` and `normalization_warmup_calls=50000` are both reasoned starting
+      points, not calibrated values -- revisit based on what this run shows.
+- [ ] Everything else from prior entries' Outstanding sections still applies.
