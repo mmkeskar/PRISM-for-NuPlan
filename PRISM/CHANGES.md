@@ -1260,4 +1260,105 @@ checkpoints (not yet the user's real ones):
 - [ ] If not: a real problem at the utility-function level specifically, worth investigating
       before anything else (e.g. whether `max_weight`/preference-biasing at construction is
       actually producing enough separation, independent of training).
+
+---
+
+## 2026-08-31 — `r_progress` simplification (drop `r_accel`) + `r_lane` direction reverted (self-correction)
+
+### Motivation
+
+Real checkpoints confirmed via `inspect_utility_functions.py` that both K=2 utility functions
+are correctly preference-differentiated (own-dimension-highest for both), so the earlier
+entries' remaining open question -- policy_1 (progress-preferring) training much worse than
+policy_0 despite no instability -- traces to `r_progress` itself, not the utility functions or
+PPO mechanics. `reward_advantage_std` measured ~4x smaller for policy_1 than policy_0
+throughout the run (0.26-0.30 vs 0.99-1.18), which explains both the flat/declining z_progress
+trend and why the same fixed `ent_coef` failed to hold entropy down for policy_1 specifically
+(a weaker reward-driven "confidence" signal loses the tug-of-war against the entropy bonus more
+easily).
+
+Root cause: `r_accel = 1 - exp(-|a_ego|/gamma_a)` rewards acceleration *magnitude*
+unconditionally, with no notion of whether a speed correction is actually needed. This
+structurally punishes ideal steady-state cruising at `v_des` -- exactly the behavior `r_speed`
+already fully rewards -- and directly fights `r_comfort`'s jerk-minimization objective. Since
+`r_progress = r_speed * r_accel * (...)` is a multiplicative AND, a policy driving well (at
+`v_des`, low jerk) was structurally capped near `r_progress`'s floor by `r_accel`, leaving very
+little signal for the utility function to differentiate on -- exactly the small,
+low-variance reward-advantage measured above.
+
+Separately, self-correction: the 2026-08-27 entry ("Two confirmed style-reward bugs") inverted
+`r_lane` to `1.0 - lane_index/(n_lanes-1)`, based on an in-code comment claiming "leftmost
+lane = 0, rightmost = N_lanes-1". That comment was itself wrong. Re-deriving `_lane_position()`
+(`prism/env/nuplan_env.py`) from scratch: it sorts candidate lanes ascending by
+`-sin(heading)*dx + cos(heading)*dy`, the projection onto the LEFT-perpendicular direction from
+ego heading (verified with a worked example: heading=0/facing east, a lane to the north at
+dy=+5 gives a positive value, and north is correctly "left" when facing east under the standard
+right-handed, counterclockwise-positive heading convention -- the same `cos_h`/`sin_h`
+decomposition is used identically in `safety_cost.py`'s blind-spot check, confirming this
+convention is consistent across the codebase). Ascending sort means the most-negative
+(rightmost) lane lands at index 0 and the most-positive (leftmost) lane lands at the highest
+index -- i.e. `lane_index=0` is the RIGHTMOST/slowest lane and `lane_index=n_lanes-1` is the
+LEFTMOST/fastest lane. This exactly matches the paper's stated convention (`docs/prism_paper_v2.tex`,
+eq. progress: "lane_index is 0 for the rightmost (slowest) lane and N-1 for the leftmost
+(fastest) lane"), meaning the 2026-08-27 inversion was wrong and is reverted here. Lesson: that
+earlier fix trusted a misleading in-code comment instead of independently re-deriving the
+geometry -- the comment has been removed rather than corrected, to avoid the same failure mode
+recurring.
+
+### Change
+
+`prism/env/rewards.py`:
+- `compute_progress()`: removed the `a_ego`/`gamma_a` parameters and the `r_accel` term
+  entirely. New formula: `r_progress = r_speed * (0.5 + 0.5 * r_lane)`. Assertiveness (closing
+  a speed gap quickly) doesn't need a separate term -- a policy slow to close a gap accumulates
+  more low-`r_speed` timesteps, which the cumulative `z_t`/`R_t` machinery already penalizes
+  over the course of an episode.
+- `r_lane` reverted to `lane_index / (n_lanes - 1)` (no `1.0 -` inversion), with the misleading
+  comment replaced by the correct derivation.
+- `compute_style_rewards()`: dropped the now-unused `a_ego` parameter and the `gamma_a` lookup.
+
+`prism/env/nuplan_env.py`: dropped `a_ego=a_lon` from the `compute_style_rewards()` call
+(`a_lon` itself is still used for jerk computation, unrelated to this change).
+
+`compute_hyperparams.py`: dropped `a_ego=float(a_lon[i])` from its own `compute_style_rewards()`
+call in the bootstrap-scaling rollout loop (this call site would otherwise have raised
+`TypeError` on the next `make hyperparams-mini`/`make hyperparams` run). `gamma_a` is still
+computed and written to `hyperparams.json` for now (harmless, simply unread by `rewards.py`
+going forward) -- not touched, out of scope for this change.
+
+`CLAUDE.md`: updated the Progress equation section to match (formula, removed `r_accel` line,
+added an explicit note on the `lane_index` convention and why it must be re-derived from
+`_lane_position()`'s geometry, not assumed from a comment).
+
+`tests/test_rewards.py`: updated `TestProgress` for the new `compute_progress()` signature;
+`test_single_lane_neutral_r_lane` reverted to assert `r2_right < r1 < r2_left` (rightmost scores
+lowest); `test_at_desired_speed_no_speed_penalty` updated to drop the `r_accel` term from its
+expected value; `test_zero_acceleration_reduces_progress` removed (no longer applicable, since
+acceleration no longer affects `r_progress` at all by design); added
+`test_leftmost_lane_scores_higher_than_rightmost` as an explicit direction-convention regression
+check. Updated the three `TestStyleRewardVector` call sites to drop `a_ego`.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing.
+- `python -c "import ast; ast.parse(open('compute_hyperparams.py').read())"` -- syntax OK.
+- Not yet run against a real DPMORL-only training run -- next step, before treating the
+  policy_1 issue as resolved or using these checkpoints for anything downstream (see
+  Outstanding).
+
+### Outstanding
+
+- [ ] Re-run `make train-dpmorl-only-mini-parallel` (or equivalent) with this fix and confirm
+      both K=2 policies now show healthy, comparable `reward_advantage_std` and improving z_T
+      trends on their own preferred dimension -- the diagnosis above is well-evidenced but not
+      yet empirically confirmed under the corrected formula.
+- [ ] `docs/prism_paper_v2.tex`: Eq. (progress) and the "Acceleration component" subsection
+      (Eq. 7, its `gamma_a` calibration text, its assertiveness citation) need a matching
+      revision to drop the acceleration term -- not done as part of this change (code-only;
+      paper prose left for the user to revise in their own voice). The lane-choice section
+      (Eq. 8) already matches the code as reverted here and needs no change.
+- [ ] Only use checkpoints from a run trained under this corrected formula as a warm-start basis
+      for the planned indicator-costs (safety) experiment -- the existing saved checkpoints from
+      the already-completed 5000-update run were trained under the old, buggy `r_progress`
+      formula and are not good warm-start candidates for that reason.
 - [ ] Everything else from prior entries' Outstanding sections still applies.

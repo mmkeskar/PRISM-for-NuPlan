@@ -214,7 +214,6 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
             j_lat=j_lat,
             v_ego=v_ego,
             v_des=regime_result.v_des,
-            a_ego=a_lon,
             lane_index=lane_index,
             n_lanes=n_lanes,
             d_lat=d_lat,

@@ -132,12 +132,23 @@ r_comfort = exp(-(j_lon^2 + j_lat^2) / sigma_j_sq)
 
 **Progress** (Eq. progress):
 ```
-r_progress = r_speed * r_accel * (0.5 + 0.5 * r_lane)
+r_progress = r_speed * (0.5 + 0.5 * r_lane)
 
 r_speed = exp(-max(0, v_des - v_ego) / (beta * v_des))
-r_accel = 1 - exp(-|a_ego| / gamma_a)
 r_lane  = lane_index / (N_lanes - 1)   [0.5 if N_lanes == 1]
 ```
+(No acceleration factor -- an earlier `r_accel = 1 - exp(-|a_ego|/gamma_a)`
+term was removed; it rewarded acceleration magnitude unconditionally,
+punishing steady-state cruising at v_des and fighting r_comfort's jerk
+minimisation. Assertiveness is already captured by r_speed accumulated over
+time via z_t. See CHANGES.md.)
+
+`lane_index` convention: 0 = rightmost (slowest) lane, N_lanes-1 = leftmost
+(fastest) lane -- set by `_lane_position()` in `nuplan_env.py`, which sorts
+candidate lanes ascending by their signed left-perpendicular offset from the
+ego heading. Do not re-derive this from a comment alone; re-derive the
+geometry (an earlier revision of `rewards.py` inverted `r_lane` after
+trusting a stale, backwards comment -- see CHANGES.md).
 
 **Desired speed regime detection** (check in this order):
 1. Congested:     v_lane_avg < 0.5 * v_limit  →  v_des = v_lane_avg

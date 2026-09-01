@@ -3,7 +3,7 @@ PRISM style reward vector (4-dimensional, all in (0, 1]).
 
 Components:
     r_comfort  : jerk-based comfort
-    r_progress : speed + acceleration + lane position
+    r_progress : speed + lane position
     r_lateral  : lateral discipline (deviation + heading)
     r_spacing  : TTC-based safe following distance
 
@@ -38,37 +38,40 @@ def compute_comfort(j_lon: float, j_lat: float, sigma_j_sq: float) -> float:
 def compute_progress(
     v_ego: float,
     v_des: float,
-    a_ego: float,
     lane_index: int,
     n_lanes: int,
     beta: float,
-    gamma_a: float,
 ) -> float:
     """
     Eq. (progress) in paper.
-    r_progress = r_speed * r_accel * (0.5 + 0.5 * r_lane)
+    r_progress = r_speed * (0.5 + 0.5 * r_lane)
+
+    No longer includes an acceleration factor (see CHANGES.md): |a_ego|
+    rewarded acceleration magnitude unconditionally, which structurally
+    punished steady-state cruising at v_des (already fully rewarded by
+    r_speed) and fought r_comfort's jerk-minimisation goal. Assertiveness
+    (closing a speed gap quickly) is already captured by r_speed accumulated
+    over time via z_t/R_t, without a separate term.
     """
     # Speed sub-reward: penalise shortfall from desired speed
     v_des_safe = max(v_des, 0.5)  # avoid division by zero
     shortfall = max(0.0, v_des_safe - v_ego)
     r_speed = math.exp(-shortfall / (max(beta, 1e-6) * v_des_safe))
 
-    # Acceleration sub-reward: reward being in motion.
-    # Floor at 0.01 so r_progress never reaches exactly 0 (CLAUDE.md: always in (0,1]).
-    r_accel = max(0.01, 1.0 - math.exp(-abs(a_ego) / max(gamma_a, 1e-6)))
-
-    # Lane position sub-reward (leftmost lane = 0, rightmost = N_lanes - 1).
-    # Per the paper (docs/prism_paper_v2.tex, eq. progress): leftmost
-    # (fastest) lane scores 1, rightmost scores 0 -- this was previously
-    # inverted (lane_index / (n_lanes-1) instead of 1 - that), rewarding
-    # the rightmost/slowest lane instead of the intended leftmost/fastest
-    # one. Fixed; see CHANGES.md.
+    # Lane position sub-reward. lane_index=0 is the RIGHTMOST (slowest)
+    # lane, lane_index=n_lanes-1 is the LEFTMOST (fastest) lane -- this is
+    # the sort order _lane_position() (nuplan_env.py) actually produces
+    # (ascending by left-perpendicular offset from ego heading), and matches
+    # the paper (docs/prism_paper_v2.tex, eq. progress). An earlier revision
+    # of this function inverted the formula based on a comment here that
+    # claimed the opposite convention; that comment was wrong and has been
+    # removed. See CHANGES.md.
     if n_lanes <= 1:
         r_lane = 0.5  # neutral when there is no lane choice
     else:
-        r_lane = 1.0 - float(lane_index) / float(n_lanes - 1)
+        r_lane = float(lane_index) / float(n_lanes - 1)
 
-    return float(r_speed * r_accel * (0.5 + 0.5 * r_lane))
+    return float(r_speed * (0.5 + 0.5 * r_lane))
 
 
 def compute_lateral_discipline(
@@ -132,7 +135,6 @@ def compute_style_rewards(
     j_lat: float,
     v_ego: float,
     v_des: float,
-    a_ego: float,
     lane_index: int,
     n_lanes: int,
     d_lat: float,
@@ -158,11 +160,9 @@ def compute_style_rewards(
     r_progress = compute_progress(
         v_ego=v_ego,
         v_des=v_des,
-        a_ego=a_ego,
         lane_index=lane_index,
         n_lanes=n_lanes,
         beta=scaling["beta"],
-        gamma_a=scaling["gamma_a"],
     )
     r_lateral = compute_lateral_discipline(
         d_lat=d_lat,

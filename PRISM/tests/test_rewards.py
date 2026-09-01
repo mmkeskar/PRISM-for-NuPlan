@@ -99,42 +99,40 @@ class TestProgress:
     def test_output_in_zero_one_interval(self):
         for v_ego in [0, 5, 10, 15]:
             for v_des in [5, 10, 15]:
-                for a_ego in [-2, 0, 2]:
-                    r = compute_progress(
-                        v_ego=v_ego, v_des=v_des, a_ego=a_ego,
-                        lane_index=0, n_lanes=1,
-                        beta=0.5, gamma_a=1.0,
-                    )
-                    assert 0.0 < r <= 1.0, (
-                        f"Out of (0,1] for v_ego={v_ego}, v_des={v_des}, a_ego={a_ego}"
-                    )
+                r = compute_progress(
+                    v_ego=v_ego, v_des=v_des,
+                    lane_index=0, n_lanes=1,
+                    beta=0.5,
+                )
+                assert 0.0 < r <= 1.0, (
+                    f"Out of (0,1] for v_ego={v_ego}, v_des={v_des}"
+                )
 
     def test_single_lane_neutral_r_lane(self):
         # Single lane: r_lane = 0.5
-        r1 = compute_progress(10, 10, 2, lane_index=0, n_lanes=1, beta=0.5, gamma_a=1.0)
-        # Two lanes: r_lane = 1 - lane_index / (n_lanes - 1). lane_index=0 is
-        # leftmost (fastest lane) per the paper (docs/prism_paper_v2.tex,
-        # eq. progress: "leftmost (fastest) lane scores 1, rightmost scores
-        # 0") -- so lane_index=0 must score HIGHEST, not lowest.
-        r2_left  = compute_progress(10, 10, 2, lane_index=0, n_lanes=2, beta=0.5, gamma_a=1.0)
-        r2_right = compute_progress(10, 10, 2, lane_index=1, n_lanes=2, beta=0.5, gamma_a=1.0)
+        r1 = compute_progress(10, 10, lane_index=0, n_lanes=1, beta=0.5)
+        # Two lanes: r_lane = lane_index / (n_lanes - 1). lane_index=0 is the
+        # RIGHTMOST (slowest) lane, lane_index=n_lanes-1 is the LEFTMOST
+        # (fastest) lane -- matches _lane_position()'s sort order
+        # (nuplan_env.py) and the paper (docs/prism_paper_v2.tex, eq.
+        # progress: "leftmost (fastest) lane scores 1, rightmost scores 0").
+        # So lane_index=0 must score LOWEST, not highest.
+        r2_right = compute_progress(10, 10, lane_index=0, n_lanes=2, beta=0.5)
+        r2_left  = compute_progress(10, 10, lane_index=1, n_lanes=2, beta=0.5)
         assert r2_right < r1 < r2_left
 
     def test_at_desired_speed_no_speed_penalty(self):
         # When v_ego == v_des, shortfall = 0, r_speed = 1
-        r = compute_progress(10, 10, a_ego=1.0, lane_index=0, n_lanes=1, beta=0.5, gamma_a=1.0)
-        # r_speed should be 1.0, r_accel depends on a_ego
+        r = compute_progress(10, 10, lane_index=0, n_lanes=1, beta=0.5)
         r_speed = 1.0
-        r_accel = 1 - math.exp(-1.0 / 1.0)
         r_lane = 0.5
-        expected = r_speed * r_accel * (0.5 + 0.5 * r_lane)
+        expected = r_speed * (0.5 + 0.5 * r_lane)
         assert r == pytest.approx(expected, rel=1e-6)
 
-    def test_zero_acceleration_reduces_progress(self):
-        r_accel_zero = compute_progress(10, 10, 0.0, 0, 1, 0.5, 1.0)
-        r_accel_pos  = compute_progress(10, 10, 2.0, 0, 1, 0.5, 1.0)
-        # r_accel = 1 - exp(-|a|/gamma_a); zero a → 0, positive a → > 0
-        assert r_accel_zero < r_accel_pos
+    def test_leftmost_lane_scores_higher_than_rightmost(self):
+        r_rightmost = compute_progress(10, 10, lane_index=0, n_lanes=4, beta=0.5)
+        r_leftmost = compute_progress(10, 10, lane_index=3, n_lanes=4, beta=0.5)
+        assert r_leftmost > r_rightmost
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,7 +204,7 @@ class TestStyleRewardVector:
     def test_returns_4d_array(self, default_hp):
         r = compute_style_rewards(
             j_lon=0.0, j_lat=0.0,
-            v_ego=10.0, v_des=10.0, a_ego=1.0,
+            v_ego=10.0, v_des=10.0,
             lane_index=0, n_lanes=1,
             d_lat=0.0, delta_psi=0.0,
             d_lead=50.0, v_lead=0.0, has_lead=False,
@@ -218,7 +216,7 @@ class TestStyleRewardVector:
     def test_all_components_in_zero_one(self, default_hp):
         r = compute_style_rewards(
             j_lon=1.0, j_lat=0.5,
-            v_ego=8.0, v_des=10.0, a_ego=1.5,
+            v_ego=8.0, v_des=10.0,
             lane_index=1, n_lanes=3,
             d_lat=0.1, delta_psi=0.05,
             d_lead=20.0, v_lead=5.0, has_lead=True,
@@ -243,7 +241,7 @@ class TestStyleRewardVector:
         )
         r_vec = compute_style_rewards(
             j_lon=0.0, j_lat=0.0,
-            v_ego=10.0, v_des=10.0, a_ego=1.0,
+            v_ego=10.0, v_des=10.0,
             lane_index=0, n_lanes=1,
             d_lat=0.15, delta_psi=0.0,
             d_lead=50.0, v_lead=0.0, has_lead=False,
