@@ -1461,3 +1461,115 @@ implicitly.
       `"preferences"`-mode iteration has taken to get right -- needs the still-unfixed
       unbounded/unregularized diversity loss (2026-08-27 area) addressed first if so.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-01 (cont.) — UtilityFunction output self-normalisation, ported from the real DPMORL repo
+
+### Motivation
+
+User has the actual DPMORL reference implementation checked out locally (`MI3/DPMORL/`, the code
+behind the NeurIPS 2023 paper this project builds on) and asked to reconcile our implementation
+against it, plus a review of the paper draft against both. Full findings below; this entry covers
+only the one change made so far (K stays <= 5 for now, so the other findings are deferred).
+
+### What the reference repo actually does (not what the paper's prose implies)
+
+Read `main_generate_utility.py`, `utility_function_parameterized.py`,
+`utility_function_programmed.py`, and `utility_env_wrapper.py`. Key findings:
+
+- For `policy_idx < reward_dim + 1` (our exact K=4/5 regime with `reward_dim=4`),
+  `main_policy.py`'s `get_utility()` uses hand-coded closed-form functions (plain mean, and
+  "weight one dimension 4x then renormalise the sum") -- **not** gradient-trained diversity
+  functions. Learned diversity training (`main_generate_utility.py`) is only used to generate
+  *additional* utility functions beyond this "obvious" corner set. This means our `"preferences"`
+  mode is methodologically consistent with the reference for K<=5 -- not a shortcut, contrary to
+  what this session's earlier entries implied.
+- The reference's utility function **self-normalises its output**: every `forward()` call
+  additionally evaluates the same network at the normalised domain's corners (all-0s, all-1s) and
+  rescales the batch's raw output via `(util - min_util) / (max_util - min_util)` before use. Our
+  `UtilityFunction.forward()` only ever normalised the *input*, never the *output* -- this is very
+  likely the actual mechanism behind two things found earlier this session: the linear
+  regularisation term dominating >99% of the observed signal, and the (separate, currently unused)
+  diversity-training loss growing unboundedly in an offline test. Neither implementation clamps
+  the output layer's bias (`make_monotone()` only clamps weights, in both repos) -- the reference
+  doesn't need to, because the corner-based rescaling makes a constant bias shift cancel out of the
+  ratio almost entirely. Ours had no such correction, so bias (and general output scale) could
+  drift freely.
+- If real diversity training is ever built (deferred -- see prior entry's Change 4/Outstanding),
+  the reference's actual loss is a **sequential/greedy soft-min (logsumexp) loss** against all
+  previously-fixed functions, not our dormant `train_utility_functions_stage1()`'s joint pairwise
+  sum-of-squares trained simultaneously -- soft-min naturally saturates once separation is
+  achieved, which is likely why the reference doesn't hit the unbounded-loss problem we found.
+  Also: the paper's Eq. 30 gradient-difference term (`J^grad`) is **not actually implemented** in
+  the reference code -- it's hardcoded to zero (`dist_grad = torch.zeros_like(...)`, loss weight
+  `0.0`) and approximated instead by an angle/"degree" term. Faithfully porting this later means
+  porting what the code does, not what the paper's equation says.
+- One place NOT ported: the reference's env wrapper drops the `gamma^t`/`gamma^{-t}` factors
+  entirely from the z_t/utility-difference pipeline (`zt_next = self.zt + reward`, undiscounted;
+  `new_reward = f(zt_next) - f(zt)`, no `gamma^{-t}`) -- `self.gamma` is set but never used in that
+  file. Our implementation and the paper's Eq. 31-32 both include these factors, which is what
+  makes the discounted sum telescope exactly to `f(z_T) - f(z_0)` (DPMORL's Theorem 2, the actual
+  proof this construction relies on). Kept our version; the reference's appears to be a practical
+  simplification that doesn't reflect the theorem as cleanly.
+
+### Change: output self-normalisation ported into `UtilityFunction.forward()`
+
+`prism/morl/utility_functions.py`: every `forward()` call now additionally batches through the
+normalised domain's corners (`zeros(reward_dim)`, `ones(reward_dim)`) in the same forward pass,
+and rescales the raw network output via `(raw_util - min_util) / (max_util - min_util + 1e-6)`
+before combining with the linear term. Monotonicity (all weights clamped >= 0, including through
+the triple-clamp activation) guarantees all-0s is the network's global minimum and all-1s its
+global maximum over the normalised domain, so this rescaling is exact, not approximate.
+
+Deliberately NOT ported: the reference's "keep_scale" option (forcing all dimensions to share one
+normalisation window) -- our 4 style dimensions have genuinely different natural scales (e.g.
+z_progress ~13-14 vs z_comfort ~70-80 in a real run), so sharing a window would compress the
+already-smaller dimension further, working against the goal here. Also not ported: the reference's
+`scale_back`/`*=2` post-processing that rescales the final output back to roughly the raw z scale
+-- our downstream pipeline (PPO's per-minibatch advantage normalisation, `vf_coef`, learning rate)
+was tuned around the utility function's existing small output scale; changing that scale
+substantially would need its own re-tuning pass, and isn't needed for the core fix (bounding /
+centering the network's contribution against its own achievable range, not matching the
+reference's absolute output magnitude).
+
+The linear term was also changed from an additive add-on (`net_out + lamda * linear_term`, using
+raw un-normalised `z`) to a convex blend (`(1-lamda)*net_out + lamda*linear_term`, both terms now
+using the same normalised `x` and both landing in ~[0,1]) -- previously the linear term's raw
+magnitude (up to ~4, from `lamda=0.05` times a z-component sum up to ~80) swamped the network's
+un-normalised output regardless of `lamda`'s intended weighting; now both terms are on a
+comparable scale, so `lamda` actually controls their relative contribution as intended.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing (including `TestMonotonicity` and
+  `test_two_policies_value_their_own_dimension_more`, unmodified -- both still pass against the
+  new forward() implementation).
+- Offline diagnostic (isolating `net_out` alone by forcing `lamda=0`): a comfort-preferring
+  policy's utility gain from a +0.7 boost to `z_comfort` (0.00358) is now ~3.4x its gain from the
+  same boost to `z_progress` (0.00106) **from the neural pathway alone**, confirming it's no
+  longer structurally desensitized -- previously this pathway's contribution was found to be
+  negligible (<1% of the observed signal, all differentiation coming from the linear term).
+- Offline telescoping-identity check (same script as the previous entry's Change 3 verification):
+  `sum(gamma^t * R_t) == f(z_T) - f(z_0)` still holds exactly (diff=0.00e+00) post-warmup with the
+  new forward() implementation.
+- Not yet run against a real training run -- next step.
+
+### Outstanding
+
+- [ ] Run DPMORL-only again with this change (plus the ent_coef decay and call-caching fixes from
+      the prior entry) and confirm both K=2 policies show meaningfully differentiated
+      `reward_advantage_std` and cleanly improving z_T trends now that the neural pathway
+      contributes real, non-desensitized signal.
+- [ ] Paper reconciliation needed (not yet done, larger scope, discussed but not actioned this
+      entry): Section IV-B/C + Algorithm 1 describe the abandoned Lagrangian CVaR mechanism
+      (Eq. 33, 36), not the actual v2 dual-critic design; Algorithm 1 line 4 ("Initialize policy
+      from CaRL checkpoint") contradicts CLAUDE.md's Design Decision #1 (train from scratch); the
+      utility function's domain is described as `[0,1]^4` (Section IV-A) but `Z^pi` is an
+      unbounded discounted sum (Eq. 14) -- needs precise language, not a design change. Also
+      worth noting: the planned `MORL-Linear` ablation baseline (Section V-C) is close in
+      mechanism to what `"preferences"`-mode PRISM has actually been running -- the K<=5
+      finding above (reference repo also uses hand-coded functions at this K) mitigates this
+      concern somewhat, but it's still worth being precise in the paper about what's actually
+      being compared.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

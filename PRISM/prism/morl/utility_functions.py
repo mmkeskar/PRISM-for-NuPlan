@@ -123,39 +123,70 @@ class UtilityFunction(nn.Module):
         z = z.float()
         self._update_running_stats(z.detach())
 
-        # Normalise input to [0, 1] with running min/max
+        # Normalise input to [0, 1] with running min/max (per-dimension --
+        # deliberately NOT the reference DPMORL repo's "keep_scale" shared-
+        # range option, since our 4 style dimensions have genuinely
+        # different natural scales, e.g. z_progress ~13-14 vs z_comfort
+        # ~70-80 in a real run -- forcing a shared window would compress the
+        # already-smaller dimension further).
         min_v = self._min_val.clamp(max=self._max_val - 1e-5)
         x = (z - min_v.unsqueeze(0)) / (self._max_val - min_v + 1e-5).unsqueeze(0)
-        x = self.input_bn(x)
-        x = self.fc_in(x)
+
+        # Output self-normalisation, ported from DPMORL's own reference
+        # implementation (MI3/DPMORL/.../utility_function_parameterized.py):
+        # evaluate this SAME network, in the SAME forward pass, at the
+        # normalised domain's corners (all-0s, all-1s), then rescale this
+        # batch's raw output into [0,1] using the network's OWN achievable
+        # range at those corners. Monotonicity (every weight clamped >= 0 by
+        # make_monotone(), including through the triple-clamp activation)
+        # guarantees all-0s is the network's global min and all-1s its
+        # global max over the normalised domain, so this is an exact
+        # rescaling, not an approximation. Without it, the network's raw
+        # output -- in particular its UNCONSTRAINED output bias
+        # (make_monotone() only clamps weights, never bias) -- could drift
+        # to any magnitude with nothing to correct it; this is very likely
+        # why the linear term below was previously found to dominate >99%
+        # of the observed signal (the un-normalised neural pathway's own
+        # contribution was comparatively tiny and structurally
+        # desensitized), and why the separate, currently-unused diversity
+        # loss grew unboundedly in an offline test. See CHANGES.md.
+        corners = torch.stack(
+            [
+                torch.zeros(self._reward_dim, device=x.device, dtype=x.dtype),
+                torch.ones(self._reward_dim, device=x.device, dtype=x.dtype),
+            ],
+            dim=0,
+        )  # (2, reward_dim)
+        h = torch.cat([corners, x], dim=0)  # (2+B, reward_dim)
+        h = self.input_bn(h)
+        h = self.fc_in(h)
 
         for bn, fc in zip(self.hidden_bns, self.hidden_layers):
-            x = self._triple_clamp(x)
-            x = bn(x)
-            x = fc(x)
+            h = self._triple_clamp(h)
+            h = bn(h)
+            h = fc(h)
 
-        x = self._triple_clamp(x)
-        x = self.fc_out(x)  # (B, 1)
+        h = self._triple_clamp(h)
+        h = self.fc_out(h)  # (2+B, 1)
 
-        # Linear regularisation: add lamda * (pref_weights . z) to keep
-        # gradient non-zero -- preference-WEIGHTED (not a plain mean), so
-        # this fallback term differentiates between policies instead of
-        # applying the same generic "grow every objective equally"
-        # incentive to all of them. In practice this term dominates the
-        # observed reward signal (>99% in an offline check) because the
-        # neural pathway above is structurally desensitized: it operates on
-        # z after min-max normalisation by the running min/max seen so far,
-        # which spans the full cumulative episode range (~0 to ~80) -- a
-        # single timestep's change in z is tiny by comparison, so the
-        # network barely reacts to it regardless of what happened that
-        # step. Getting this term right therefore matters far more than
-        # its "regularisation" name implies. See CHANGES.md.
-        linear_term = self._lamda * (z * self._pref_weights).sum(dim=-1, keepdim=True)
-        out = x + linear_term  # (B, 1)
+        min_util, max_util, raw_util = h[0, 0], h[1, 0], h[2:, 0]  # (), (), (B,)
+        net_out = (raw_util - min_util) / (max_util - min_util + 1e-6)  # (B,), in [0, 1]
+
+        # Linear regularisation term -- preference-WEIGHTED (not a plain
+        # mean), so it differentiates between policies instead of applying
+        # the same generic "grow every objective equally" incentive to all
+        # of them. Now blended as a CONVEX combination with net_out (both in
+        # ~[0,1]) via lamda, rather than added on top of an un-normalised
+        # net_out -- keeps the two terms on a comparable scale, so lamda
+        # actually controls their relative weight instead of the linear
+        # term dominating purely because it happened to be numerically
+        # larger (the >99% figure above). See CHANGES.md.
+        linear_term = (x * self._pref_weights).sum(dim=-1)  # (B,)
+        out = (1.0 - self._lamda) * net_out + self._lamda * linear_term  # (B,)
 
         if squeeze:
-            return out.squeeze(0).squeeze(-1)  # scalar
-        return out.squeeze(-1)  # (B,)
+            return out.squeeze(0)  # scalar
+        return out
 
     # ------------------------------------------------------------------
     # NumPy convenience wrapper (used in env step)
