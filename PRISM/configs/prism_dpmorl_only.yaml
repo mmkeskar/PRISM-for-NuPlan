@@ -90,6 +90,11 @@ stage2:
   # perturbs it. 0.001 (10x smaller than the original 0.01, not exactly 0)
   # is a reasoned starting point for a small floor, not a precisely
   # calibrated value -- may need further tuning. See CHANGES.md.
+  # Now also decayed linearly to 0 over the run (ent_coef_decay: true by
+  # default, same mechanism as the LR decay below) -- this INITIAL value is
+  # the start of that decay, not a constant for the whole run. See CHANGES.md
+  # 2026-09-01 entry for why a non-decaying ent_coef never fully removes the
+  # upward pull on entropy, just slows it.
   ent_coef: 0.001
   max_grad_norm: 0.5
   gae_lambda: 0.95

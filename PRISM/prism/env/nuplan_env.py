@@ -439,6 +439,7 @@ class PRISMEnv(EnvironmentWrapper):
         self._zt = np.zeros(_REWARD_DIM, dtype=np.float64)
         self._et = 0.0
         self._t = 0
+        self._f_zt: Optional[float] = None  # set for real in reset(), see there
 
     # ------------------------------------------------------------------
     # Utility function updates
@@ -456,6 +457,9 @@ class PRISMEnv(EnvironmentWrapper):
         self._zt = np.zeros(_REWARD_DIM, dtype=np.float64)
         self._et = 0.0
         self._t = 0
+        # f(z_0), cached and reused as f_curr on the first step() call --
+        # see step()'s comment for why this caching matters.
+        self._f_zt = float(self._utility_fn(self._zt))
         obs["value_measurements"] = self._zt_normaliser.normalise(self._zt)
         obs["cumulative_cost"] = np.array([self._et], dtype=np.float32)
         return obs, info
@@ -482,14 +486,21 @@ class PRISMEnv(EnvironmentWrapper):
         et_next = self._et + (self._gamma ** self._t) * c_t
 
         # DPMORL scalar reward: R_t = gamma^{-t} * [f(z_{t+1}) - f(z_t)]
+        # f(z_t) was already computed as f_next on the previous step (or at
+        # reset(), for t=0) -- self._zt hasn't changed since then, so reuse
+        # it instead of a second, redundant utility_fn forward pass. Halves
+        # the utility function's per-step call count (previously 2 calls/
+        # step), which also makes UtilityFunction's normalization_warmup_calls
+        # docstring accurate again (it assumed ~1 call/step). See CHANGES.md.
+        f_curr = self._f_zt
         f_next = float(self._utility_fn(zt_next))
-        f_curr = float(self._utility_fn(self._zt))
         R_t = (self._gamma ** (-self._t)) * (f_next - f_curr)
 
         # Update cumulative state
         self._zt = zt_next
         self._et = et_next
         self._t += 1
+        self._f_zt = f_next
 
         # Update normaliser at episode end
         if termination or truncation:

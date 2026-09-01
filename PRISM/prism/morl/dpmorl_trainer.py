@@ -209,6 +209,20 @@ class DPMORLTrainer:
         # with, matching cfg["stage2"]["learning_rate"].
         self._initial_lr = optimizer.param_groups[0]["lr"]
         self._lr_decay = cfg.get("lr_decay", True)
+        # Linear ent_coef decay to 0 over the run, same rationale as LR decay
+        # above -- action_heads.py's own docstring already diagnoses why this
+        # was needed: the entropy bonus (-ent_coef * entropy) is a constant,
+        # unopposed pull toward higher log_std, while PPO's own gradient on
+        # log_std is structurally close to zero (per-minibatch advantage
+        # normalization + ratio~1 make it near-self-cancelling). A fixed,
+        # non-zero ent_coef therefore never stops pulling entropy upward --
+        # it only pulls more slowly -- which is consistent with the late-
+        # training entropy upticks seen even after reducing ent_coef
+        # 0.01 -> 0.001 (see CHANGES.md). Decaying it to 0 removes the
+        # persistent pull entirely by the end of training instead of just
+        # shrinking it.
+        self._initial_ent_coef = cfg.get("ent_coef", 0.01)
+        self._ent_coef_decay = cfg.get("ent_coef_decay", True)
         self.env = env
         self.utility_fn = utility_fn
         self.hp = hp
@@ -267,7 +281,8 @@ class DPMORLTrainer:
             "git_commit": _GIT_COMMIT,
             "beta": self._beta, "tau": self._tau,
             "cf_coef": cfg.get("cf_coef", 0.5), "vf_coef": cfg.get("vf_coef", 0.5),
-            "ent_coef": cfg.get("ent_coef", 0.01), "clip_coef": cfg.get("clip_coef", 0.2),
+            "ent_coef": cfg.get("ent_coef", 0.01), "ent_coef_decay": self._ent_coef_decay,
+            "clip_coef": cfg.get("clip_coef", 0.2),
             "gamma": cfg.get("gamma", 0.99), "gae_lambda": cfg.get("gae_lambda", 0.95),
             "max_grad_norm": cfg.get("max_grad_norm", 0.5),
             "update_epochs": cfg.get("update_epochs", 4),
@@ -333,6 +348,14 @@ class DPMORLTrainer:
                     pg["lr"] = current_lr
             else:
                 current_lr = self._initial_lr
+
+            # Linear ent_coef decay: 1.0 -> 0.0 fraction of initial_ent_coef
+            # over the run (see __init__ for why).
+            if self._ent_coef_decay:
+                ent_frac = 1.0 - (update / max(n_updates, 1))
+                current_ent_coef = self._initial_ent_coef * ent_frac
+            else:
+                current_ent_coef = self._initial_ent_coef
 
             # Guard: alpha must never reach 1.0 (defense-in-depth -- neither
             # update_var nor compute_empirical_cvar currently divides by
@@ -468,7 +491,7 @@ class DPMORLTrainer:
 
             # ── PPO update ─────────────────────────────────────────────
             ppo_start = time.time()
-            loss_info = self._ppo_update(next_obs, dense_costs)
+            loss_info = self._ppo_update(next_obs, dense_costs, ent_coef=current_ent_coef)
             ppo_end = time.time()
 
             # A2 -- NaN/Inf halt check. c~_t (dense_nan, above), A_t^C, and
@@ -560,6 +583,7 @@ class DPMORLTrainer:
                 "clip_fraction": loss_info["clip_fraction"],
                 "reward_advantage_std": loss_info["reward_advantage_std"],
                 "current_lr": current_lr,
+                "current_ent_coef": current_ent_coef,
                 "nan_detected": loss_info["nan_detected"],
                 "nan_streak": self._nan_streak,
                 "rollout_time_s": rollout_end - rollout_start,
@@ -711,7 +735,9 @@ class DPMORLTrainer:
     # PPO update
     # ------------------------------------------------------------------
 
-    def _ppo_update(self, last_obs: dict, dense_costs: np.ndarray) -> Dict[str, float]:
+    def _ppo_update(
+        self, last_obs: dict, dense_costs: np.ndarray, ent_coef: float
+    ) -> Dict[str, float]:
         """
         Single PPO update combining reward and cost advantages through the
         SAME clipped-ratio objective:
@@ -724,13 +750,16 @@ class DPMORLTrainer:
         reported purely as diagnostics for beta calibration (per spec
         section 11) -- they do not sum exactly to the clipped total_loss,
         since clipping is nonlinear in the combined advantage.
+
+        ent_coef is passed in (this update's decayed value, see __init__)
+        rather than read from self.cfg -- self.cfg only holds the initial
+        value.
         """
         gamma = self.cfg.get("gamma", 0.99)
         gae_lambda = self.cfg.get("gae_lambda", 0.95)
         clip_coef = self.cfg.get("clip_coef", 0.2)
         vf_coef = self.cfg.get("vf_coef", 0.5)
         cf_coef = self.cfg.get("cf_coef", 0.5)
-        ent_coef = self.cfg.get("ent_coef", 0.01)
         update_epochs = self.cfg.get("update_epochs", 4)
         minibatch_size = self.cfg.get("minibatch_size", 64)
         max_grad_norm = self.cfg.get("max_grad_norm", 0.5)

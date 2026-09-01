@@ -1362,3 +1362,102 @@ check. Updated the three `TestStyleRewardVector` call sites to drop `a_ego`.
       the already-completed 5000-update run were trained under the old, buggy `r_progress`
       formula and are not good warm-start candidates for that reason.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-01 — Git commit logging, ent_coef decay, and a redundant utility_fn call fix
+
+### Motivation
+
+Full re-audit of the DPMORL training pipeline (utility function, `PRISMEnv`'s z_t/e_t/R_t
+plumbing, GAE/PPO update, entropy head) requested after several rounds of narrow, symptom-by-
+symptom fixes started feeling slow. Three real, independently-fixable issues found; a fourth
+(the utility function's neural pathway being ~99% dominated by its linear regularization term,
+since Stage 1 `"preferences"` mode never gradient-trains the network -- see the 2026-08-27
+"root cause found" entry) was re-confirmed but deliberately left as-is pending a decision on
+whether to revisit deferring `"diversity"` mode Stage 1 training.
+
+### Change 1: git commit hash in the metrics config record
+
+Immediately motivated by a real mix-up this session: confirming which run reflected the
+`r_progress`/`r_lane` fix (previous entry) required manually cross-referencing a `git pull`
+terminal timestamp against the push time, because `MetricsLogger` appends rather than
+overwrites (see `metrics_logger.py`), so a `policy_k_metrics.jsonl` left over from an un-cleared
+output dir can silently mix runs from different code versions with no way to tell which is
+which after the fact. `prism/morl/dpmorl_trainer.py` now captures `git rev-parse --short HEAD`
+once at import time and logs it in every policy's `config` record; `scripts/analyze_metrics.py`
+surfaces it in its printed config line.
+
+### Change 2: `ent_coef` linear decay to 0 (mirrors the existing `learning_rate` decay)
+
+`action_heads.py`'s own docstring already diagnoses the mechanism behind the entropy-runaway
+family of bugs this branch has repeatedly hit: PPO's gradient on `log_std` is "structurally
+close to zero" (per-minibatch advantage normalization + ratio~1 make it near-self-cancelling),
+while `-ent_coef * entropy` is a constant, unopposed pull toward higher entropy. `learning_rate`
+already decays linearly to 0 over a run (2026-08-29 bundled-fix entry), but `ent_coef` never
+did -- it was read fresh from the static config dict every update, so even the reduced
+`ent_coef=0.001` guaranteed the upward pull never actually disappeared, just slowed down. This
+is consistent with the late-training entropy uptick seen in policy_0's most recent run (after
+the `r_progress`/`r_lane` fix) despite `ent_coef` already having been reduced twice this
+project. `DPMORLTrainer` now decays `ent_coef` linearly to 0 over `n_updates`, same
+`frac = 1.0 - update/n_updates` pattern as the LR decay, controlled by a new `ent_coef_decay`
+config key (default `True`). `_ppo_update()` now takes `ent_coef` as a parameter (this update's
+decayed value) instead of reading `self.cfg` directly, since `self.cfg` only holds the initial
+value. Logged per-update as `current_ent_coef`, and `ent_coef_decay` is logged in the config
+record.
+
+### Change 3: redundant utility-function forward pass per env step
+
+`PRISMEnv.step()` computed `R_t = gamma^{-t} * [f(z_{t+1}) - f(z_t)]` via two separate calls to
+the utility function every step -- `f_next = f(z_{t+1})` and `f_curr = f(z_t)`. But `f(z_t)` is
+the exact same value already computed as `f_next` on the *previous* step (`self._zt` doesn't
+change except via `step()`), never cached. Fixed: `PRISMEnv` now caches `self._f_zt` (computed
+once at `reset()` for `f(z_0)`, then updated to `f_next` at the end of each `step()`) and reuses
+it as the next step's `f_curr`, halving the utility function's per-step call count. Verified
+offline that this doesn't change the telescoping identity `sum(gamma^t * R_t) == f(z_T) - f(z_0)`
+once the normalization range is frozen (post-warmup) -- confirmed exact equality (diff=0) for
+both the old and cached call patterns in a synthetic 20-step rollout; the two patterns only
+disagree during the warmup phase itself, because the normalization range (and therefore `f`) is
+a genuinely moving target then regardless of caching -- a pre-existing, already-accepted property
+of the warmup design, not something this change introduces or worsens.
+
+Side effect: `UtilityFunction.__init__`'s `normalization_warmup_calls` docstring assumed ~1
+`forward()` call per env step ("~50k calls is roughly 165-330 episodes at ~150-300
+calls/episode"), which was actually wrong before this fix (2 calls/step means the real freeze
+point was ~82-165 episodes, half what the comment claimed) and is now accurate again. Comment
+updated to note this explicitly.
+
+### Change 4 (not made): utility function neural pathway still ~99% linear-term-dominated
+
+Re-confirmed, not re-litigated: in `"preferences"` mode (used by every run so far),
+`init_utility_functions_from_preferences()` constructs each `UtilityFunction` once and biases
+`fc_in`'s weights toward the preference vector, but the network's parameters are **never**
+included in Stage 2's optimizer (`run_stage2()` builds it only from
+`agent.trainable_parameters()`), so the monotone-NN pathway never receives a gradient update --
+its behavior is whatever the one-time construction produced, forever. Combined with the
+already-documented desensitization (`utility_functions.py:136-148`: the neural pathway operates
+on `z` normalized against the full episode-cumulative range, so a single step's change is
+invisible to it), what's actually running is close to linear preference-weighted scalarization
+with a monotone-NN wrapper, not DPMORL's actual non-linear, diversity-trained utility functions.
+This is the same gap flagged in the 2026-08-27 entry and deferred by explicit user choice ("we
+can do that later"); resurfaced here because it's likely the single largest remaining lever for
+DPMORL personalization quality, and worth an explicit decision rather than continuing to defer
+implicitly.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing (no test-suite code touched by this entry).
+- `python -c "import ast; ..."` syntax check on all three touched files.
+- Offline synthetic-rollout script (see Change 3) confirming the caching fix preserves the R_t
+  telescoping identity post-warmup.
+- Not yet run against a real training run -- next step.
+
+### Outstanding
+
+- [ ] Run DPMORL-only again with `ent_coef_decay` active and confirm the late-training entropy
+      upticks (seen in both the original entropy-runaway case and policy_0's most recent run)
+      are gone or substantially reduced.
+- [ ] Decide whether to revisit Stage 1 `"diversity"` mode (Change 4) now, given how long
+      `"preferences"`-mode iteration has taken to get right -- needs the still-unfixed
+      unbounded/unregularized diversity loss (2026-08-27 area) addressed first if so.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

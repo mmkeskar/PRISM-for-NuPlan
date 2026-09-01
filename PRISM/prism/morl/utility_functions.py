@@ -65,9 +65,13 @@ class UtilityFunction(nn.Module):
         # training it's evaluated, since the range it's divided by keeps
         # growing. A moving target for the network to fit against the whole
         # run, not just a warmup-period effect. ~50k calls is roughly
-        # 165-330 episodes (at ~150-300 calls/episode) -- enough to get a
+        # 165-330 episodes (at ~150-300 calls/episode, i.e. ~1 forward()
+        # call per env step -- PRISMEnv.step() previously called this twice
+        # per step (once for f(z_t), once for f(z_{t+1}), not caching the
+        # overlap between consecutive steps), which silently halved this to
+        # ~82-165 episodes; fixed, see CHANGES.md) -- enough to get a
         # representative sense of the achievable range without waiting so
-        # long that most of a run still has it drifting. See CHANGES.md.
+        # long that most of a run still has it drifting.
         self._normalization_warmup_calls = normalization_warmup_calls
 
         # Input layer: reward_dim -> n_hidden
