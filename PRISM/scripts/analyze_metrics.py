@@ -135,7 +135,8 @@ def report_run(label, cfg, ups, n_bins=10):
 
     n = len(ups)
     span = ups[-1]["wall_time"] - ups[0]["wall_time"]
-    print(f"config: beta={cfg.get('beta')} cf_coef={cfg.get('cf_coef')} "
+    print(f"config: git_commit={cfg.get('git_commit', 'n/a (predates commit logging)')} "
+          f"beta={cfg.get('beta')} cf_coef={cfg.get('cf_coef')} "
           f"fixed_alpha={cfg.get('fixed_alpha')} outcome_costs_enabled={cfg.get('outcome_costs_enabled')} "
           f"active_indicators={cfg.get('active_indicators')} cost_scale={cfg.get('cost_scale')}")
     print(f"updates: {n}  (#{ups[0]['update']} -> #{ups[-1]['update']})   "

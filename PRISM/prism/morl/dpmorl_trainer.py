@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import math
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +84,27 @@ _STYLE_DIM_NAMES = ("comfort", "progress", "lateral", "spacing")
 _ZERO_COST_WARN_STREAK = 10   # consecutive updates with all-zero episode cost
 _TELESCOPING_REL_TOL = 1e-4   # per-episode runtime check tolerance
 _NAN_HALT_STREAK = 3          # consecutive updates with NaN/Inf before halting
+
+
+def _get_git_commit() -> str:
+    """Best-effort short git commit hash of this checkout, for run
+    provenance in the metrics config record. MetricsLogger appends rather
+    than overwrites (see metrics_logger.py), so if an output dir isn't
+    cleared between a `git pull` and a rerun, a single policy_k_metrics.jsonl
+    can end up containing runs from two different code versions with no way
+    to tell them apart after the fact -- this closes that gap."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+_GIT_COMMIT = _get_git_commit()
 
 
 @dataclass
@@ -242,6 +264,7 @@ class DPMORLTrainer:
         )
         self._metrics.log_config({
             "policy_id": policy_id,
+            "git_commit": _GIT_COMMIT,
             "beta": self._beta, "tau": self._tau,
             "cf_coef": cfg.get("cf_coef", 0.5), "vf_coef": cfg.get("vf_coef", 0.5),
             "ent_coef": cfg.get("ent_coef", 0.01), "clip_coef": cfg.get("clip_coef", 0.2),
