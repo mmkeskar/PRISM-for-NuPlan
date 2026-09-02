@@ -1824,3 +1824,67 @@ make train-dpmorl-only-mini-parallel UTILITY_ABLATION=linear_projection LOG_REWA
       now that both the cache-path issue (user error, not a bug) and the `--skip_stage1` gap
       (real bug, now fixed) are resolved.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-02 (cont.) — Fixed the K=2 preference-vector concentration (Test 1's root cause)
+
+### Change
+
+`scripts/train.py`'s `_get_preference_vectors()` generic fallback (used for any K not covered by
+the curated K=4/K=5 lists, i.e. our actual K=2 setup) previously derived each policy's vector as
+`base=1/reward_dim` with `+=0.4*(1-base)` boost to its own dimension, then renormalised. That
+produces an own:other concentration ratio of only ~2.2 (e.g. 0.4231/0.1923 for K=2) -- much weaker
+than the curated lists' ratio of 3.67 (0.55/0.15). Ratio, not the post-renormalisation values, is
+what determines cosine similarity between two policies' vectors (renormalising doesn't change a
+vector's direction), so this directly explains the previous entry's Test 1 finding: real K=2
+utility-function gradients had cosine similarity ~0.81, matching the OLD formula's own vectors'
+cosine similarity (0.8164) almost exactly.
+
+Fixed to use the same 0.55/0.15 concentration the curated lists already use, generalised to any
+`reward_dim`/K via `low=0.15`, `high=1-(reward_dim-1)*low` (asserts `high > low`, i.e. sensible up
+to `reward_dim<=6` for `low=0.15`). For `reward_dim=4`, this reproduces the curated K=4 list
+exactly, which made the separate `n_policies==4` special case in `_get_preference_vectors()` pure
+duplicate logic -- removed it, folding into the (now-correct) generic formula. The `n_policies==5`
+case is NOT redundant and was kept: the generic formula's `k % reward_dim` indexing would wrap
+policy index 4 back to dimension 0, duplicating policy 0's vector, rather than producing the
+intended "balanced" `[0.25,0.25,0.25,0.25]` 5th vector. Also fixed the mirrored (but, per
+`run_stage1()`'s actual call pattern, unreachable in practice) fallback inside
+`init_utility_functions_from_preferences()` in `prism/morl/utility_functions.py`, since its own
+docstring already documents it as matching `_get_preference_vectors()` -- kept in sync rather than
+leaving a second, inconsistent copy of the same formula.
+
+New K=2 cosine similarity: 0.5676 (down from 0.8164) -- a real, not cosmetic, improvement. Not
+zero: two non-negative, fixed-sum, non-sparse preference vectors can't be fully orthogonal by
+construction; that would need one-hot vectors (`LinearProjectionUtility`'s ablation), a bigger
+design departure (a policy would then care nothing at all about its non-preferred dimensions,
+rather than mostly-but-not-only).
+
+Pre-existing, still-unfixed limitation noted but not touched: for `n_policies=3`, dimension 3 is
+never emphasized (`k % reward_dim` only reaches 0,1,2 for k=0,1,2) -- not relevant to the current
+K=2 setup, left as a known gap for if/when K=3 is ever used.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing.
+- `_get_preference_vectors(2, 4)` -> `[[0.55,0.15,0.15,0.15], [0.15,0.55,0.15,0.15]]`; measured
+  cosine similarity 0.5676 (matches hand calculation).
+- `_get_preference_vectors(4, 4)` and `_get_preference_vectors(5, 4)` -- unchanged output vs.
+  before this fix (K=4 now via the generic path instead of a separate special case; K=5 still via
+  its own kept special case) -- confirmed no regression for the two K values every prior run this
+  session actually used.
+- `init_utility_functions_from_preferences(n_policies=2, reward_dim=4)`'s resulting
+  `_pref_weights` match `_get_preference_vectors(2, 4)` exactly -- the two paths stay in sync as
+  the docstring claims.
+
+### Outstanding
+
+- [ ] Re-run K=2 DPMORL-only with this fix (git_commit will disambiguate automatically now) and
+      check whether the entropy/divergence issues from the last several entries improve --
+      **calibrated expectation, not a guarantee**: this fixes the diagnosed Stage-1 cause (weak
+      preference-vector separation), but doesn't touch `r_progress`'s own low mean/possible
+      floor-saturation (still-open question from the reward-component-spread diagnostic, not yet
+      run) or the entropy-decay-vs-reward-scale interaction from two entries back -- those could
+      still limit policy_1 specifically even with better-separated utility functions. Don't
+      over-read a clean or a messy result in isolation from those other still-open threads.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

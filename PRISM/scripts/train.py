@@ -223,26 +223,47 @@ def _get_preference_vectors(n_policies: int, reward_dim: int) -> list:
             [0.15, 0.15, 0.15, 0.55],  # spacing
             [0.25, 0.25, 0.25, 0.25],  # balanced
         ]
-    if n_policies == 4 and reward_dim == 4:
-        # The 5-policy list above minus "balanced" -- keeps all 4 style
-        # extremes (full reward-dimension coverage) rather than falling
-        # through to the generic formula below, which for n_policies=4
-        # produces a less extreme skew (~42/19/19/19 vs 55/15/15/15) and
-        # for n_policies=3 specifically never emphasizes one dimension at
-        # all (k % reward_dim never reaches it).
-        return [
-            [0.55, 0.15, 0.15, 0.15],  # comfort
-            [0.15, 0.55, 0.15, 0.15],  # progress
-            [0.15, 0.15, 0.55, 0.15],  # lateral discipline
-            [0.15, 0.15, 0.15, 0.55],  # spacing
-        ]
-    base = 1.0 / reward_dim
+    # No separate n_policies==4 case here anymore -- the generic formula
+    # below now reproduces the curated 4-policy list above exactly (all
+    # four style extremes, same 0.55/0.15 concentration), so the two would
+    # otherwise be duplicate logic. It's still a SPECIAL CASE relative to
+    # n_policies==5, which the generic formula can't reproduce: policy
+    # index 4 would wrap around (4 % reward_dim == 0) and duplicate
+    # policy 0's vector instead of giving a genuinely "balanced" 5th
+    # policy, so that case is kept above.
+
+    # own:other concentration ratio matches the curated lists above
+    # (0.55:0.15 = 3.67), not a weaker ratio -- this used to be
+    # base=1/reward_dim with a +=0.4*(1-base) boost then renormalise,
+    # which produces only a ~2.2 ratio (e.g. 0.4231/0.1923 for K=2). Ratio
+    # is scale-invariant to renormalisation, so that weaker ratio directly
+    # meant weaker COSINE SEPARATION between different policies' vectors
+    # regardless of normalisation -- confirmed via
+    # scripts/check_gradient_alignment.py against a real K=2 run: nabla
+    # f_0(z) and nabla f_1(z) had cosine similarity ~0.81, essentially
+    # constant across 2000 real z points sampled, matching the old
+    # formula's vectors' own cosine similarity (0.8164) almost exactly.
+    # This fix's vectors have cosine similarity 0.5676 for K=2 -- a real,
+    # not cosmetic, improvement (not zero: two non-negative, fixed-sum,
+    # non-sparse vectors can't be fully orthogonal; that would need
+    # one-hot vectors, i.e. LinearProjectionUtility's ablation). See
+    # CHANGES.md.
+    #
+    # Pre-existing, still-unfixed limitation kept as-is: for n_policies=3,
+    # dimension 3 is never emphasized (k % reward_dim only reaches 0,1,2).
+    low = 0.15
+    high = 1.0 - (reward_dim - 1) * low
+    assert high > low, (
+        f"reward_dim={reward_dim} makes high={high:.3f} <= low={low} -- "
+        f"the 0.55/0.15-style concentration only makes sense while "
+        f"(reward_dim - 1) * {low} < {1.0 - low:.2f} (reward_dim <= 6 for "
+        f"low=0.15)."
+    )
     vecs = []
     for k in range(n_policies):
-        vec = [base] * reward_dim
-        vec[k % reward_dim] += 0.4 * (1.0 - base)
-        total = sum(vec)
-        vecs.append([v / total for v in vec])
+        vec = [low] * reward_dim
+        vec[k % reward_dim] = high
+        vecs.append(vec)
     return vecs
 
 

@@ -392,15 +392,25 @@ def init_utility_functions_from_preferences(
                 [0.25, 0.25, 0.25, 0.25],  # balanced
             ]
         else:
-            # Evenly distribute emphasis
-            base = [1.0 / reward_dim] * reward_dim
+            # Same own:other concentration ratio as the K=4/K=5 curated
+            # lists (0.55:0.15) -- mirrors scripts/train.py's
+            # _get_preference_vectors(), which this docstring already
+            # claims to match. Previously used base=1/reward_dim with a
+            # +=0.4*(1-base) boost then renormalise, which produces a
+            # weaker ~2.2 own:other ratio (vs 3.67 here) -- root-caused via
+            # scripts/check_gradient_alignment.py to real cosine similarity
+            # ~0.81 between two K=2 policies' utility-function gradients
+            # (this fix: 0.5676). See CHANGES.md. (In practice this branch
+            # is unreachable from scripts/train.py, which always passes
+            # explicit preference_vectors from _get_preference_vectors() --
+            # kept in sync anyway since this function's own docstring
+            # documents it as the mirrored default.)
+            low = 0.15
+            high = 1.0 - (reward_dim - 1) * low
             preference_vectors = []
             for k in range(n_policies):
-                vec = base.copy()
-                obj_idx = k % reward_dim
-                vec[obj_idx] += 0.4 * (1.0 - 1.0 / reward_dim)
-                total = sum(vec)
-                vec = [v / total for v in vec]
+                vec = [low] * reward_dim
+                vec[k % reward_dim] = high
                 preference_vectors.append(vec)
 
     ufs = []
