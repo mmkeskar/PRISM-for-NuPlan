@@ -1635,3 +1635,108 @@ project.
       -- the analysis above suggests scale mismatch, not an incorrectly-shaped decay schedule, was
       the actual problem.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-02 (cont.) — Three new diagnostics for the K-policy-divergence investigation
+
+### Motivation
+
+output_scale=16.0 (previous entry) fixed policy_0 (cleanest entropy decrease seen yet) but left
+policy_1 with a flat-then-plateauing entropy (~2.0-2.1) and a progress-divergence margin that
+shrank to a near-tie (14.322 vs 14.217). An offline check of whether comfort/progress reward
+SHAPES intrinsically differ in per-step variance (synthetic input distributions) did not confirm
+that hypothesis (variance ratio ~0.97x, i.e. roughly equal) -- but it did reveal the assumed input
+distributions were unrealistic (real z_progress/z_comfort ratios imply mean r_progress~0.16 vs
+mean r_comfort~0.89, the opposite of what the synthetic sweep produced), meaning reasoning from
+synthetic data isn't reliable here. User (via a separate consultation) proposed two decisive
+tests instead of further synthetic guessing, plus asked for direct visibility into reward
+component spread. All three built this entry; none required another full training run to be
+useful (Test 1 and the ablation both work with data/infra already in place; the component
+logging needs one new run, but is cheap to add to whatever runs next).
+
+### Test 1: `scripts/check_gradient_alignment.py`
+
+Computes nabla f_0(z) and nabla f_1(z) via autograd at REAL z points -- every update's mean z_T,
+pulled straight from the two policies' existing metrics.jsonl files (no new run needed) -- and
+reports the distribution of cosine similarity between the two gradients. Near 1.0 means the two
+(different-by-construction) utility functions point in nearly the same direction across the
+region actually reached during training, which alone would explain weak divergence regardless of
+PPO/environment/reward-formula correctness. Reuses `inspect_utility_functions.load_checkpoint()`
+and `analyze_metrics.load_runs()` rather than duplicating their parsing/loading logic. Verified
+against synthetic checkpoints + a synthetic metrics.jsonl (mean cosine ~0.81 for two utility
+functions built from clearly-different-but-not-orthogonal preference vectors, as expected).
+
+### Test 2: `LinearProjectionUtility` + `--utility_ablation linear_projection`
+
+`prism/morl/utility_functions.py`: new `LinearProjectionUtility(reward_dim, dim)` -- f(z) = z[dim]
+exactly, bypassing ALL learned/preference-biased machinery (no monotone network, no
+normalisation, no linear-term blend). Gradients are one-hot and orthogonal everywhere in R^4 by
+construction -- no saturation, no shared-direction confound possible, unlike the real utility
+functions Test 1 checks. `scripts/train.py --utility_ablation linear_projection` bypasses Stage 1
+entirely (`run_stage1()` short-circuits before the preferences/diversity dispatch) and constructs
+one projection per policy with matching one-hot `w_k` (FiLM conditioning stays consistent with
+what the utility function actually rewards). Cleanly separates two hypotheses: if K policies
+diverge under this, the DPMORL/PPO machinery works and the bottleneck is specifically Stage 1
+utility-function construction; if they still don't diverge, the problem is downstream (reward
+formulas, environment) and Stage 1 isn't the bottleneck.
+
+Side effect worth knowing (documented in the class docstring): because `PRISMEnv` updates
+`z_{t+1} = z_t + gamma^t * r_vec`, `f(z_{t+1}) - f(z_t) = gamma^t * r_vec[dim]_t` exactly when
+`f(z) = z[dim]`, so `R_t = gamma^{-t} * (...) = r_vec[dim]_t` -- this ablation is simultaneously a
+test of "does PPO on the RAW per-step reward component alone, with no DPMORL z_t/utility
+wrapping at all, produce divergence." Requires `n_policies <= reward_dim` (asserted) -- no
+sensible K+1-th projection. `inspect_utility_functions.py` won't produce a meaningful report
+against checkpoints from this ablation (it assumes the real `UtilityFunction`'s buffers) -- not
+needed anyway, since this ablation's behavior is fully known by construction.
+
+### Reward-component logging + `scripts/analyze_reward_spread.py`
+
+Refactored `compute_progress()`/`compute_lateral_discipline()` in `prism/env/rewards.py` to share
+new `_progress_components()`/`_lateral_components()` helpers with a new
+`compute_style_rewards_verbose()` (returns `(r_vec, components_dict)`, verified byte-identical
+`r_vec` to `compute_style_rewards()`) -- one implementation of each formula, not two that could
+drift apart. `PRISMRewardBuilder` gets a new `log_components` flag (off by default); when on,
+`build_reward()` exposes `info["reward_components"]` (`r_speed`, `r_lane`, `r_dev`, `r_heading`,
+`jerk_lon`, `jerk_lat`, `ttc` -- `ttc` is `None`, not `inf`, when there's no lead vehicle, since
+`json.dumps` can't serialise `inf`/`nan`). `DPMORLTrainer` accumulates these per update and logs
+`rc_<name>_mean`/`rc_<name>_std` in the metrics record, alongside the existing `z_stats`/
+`outcome_stats` pattern. Wired through `make_prism_env()` and `_build_env()` to a new
+`scripts/train.py --log_reward_components` flag / `cfg["log_reward_components"]` key.
+
+`scripts/analyze_reward_spread.py` (stdlib-only, matches `analyze_metrics.py`'s portability)
+reports each component's mean/std over a run and flags two saturation directions: pinned near its
+ceiling with low std (little room left to differentiate -- the "reward is basically maxed out"
+case), or pinned near its floor with low std (the more concerning case in practice -- usually
+means the policy is persistently far from what the component wants, e.g. consistently well below
+desired speed, not that the reward is well-tuned and topped out). Verified against synthetic
+metrics.jsonl data for both saturation directions and a healthy-spread case; correctly produces
+no flag for a merely-low-but-not-pinned value (mean=0.16, floor-room=0.16, above the 0.05
+threshold).
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing (no test-suite code touched; the rewards.py refactor
+  is behavior-preserving, confirmed by the existing suite still passing unmodified, plus a direct
+  check that `compute_style_rewards_verbose()`'s `r_vec` is byte-identical to
+  `compute_style_rewards()`'s for the same inputs).
+- `run_stage1()` with the linear_projection ablation tested directly (offline, no nuPlan/CaRL
+  needed): produces `f(z)=z[dim]` exactly for both policies, checkpoint save/load roundtrips
+  correctly, and the `n_policies > reward_dim` case raises the expected `AssertionError`.
+- `check_gradient_alignment.py` and `analyze_reward_spread.py` both run end-to-end against
+  synthetic checkpoints/metrics.jsonl data and produce sensible, correctly-triggering output.
+- `PRISMRewardBuilder(log_components=True)` constructs without error (offline, no simulation
+  needed for the constructor itself).
+- Not yet run against real data for Test 1 (needs the user's actual checkpoints + metrics.jsonl)
+  or a real training run with `--log_reward_components` -- both are ready to use now.
+
+### Outstanding
+
+- [ ] Run Test 1 against the real K=2 checkpoints + metrics.jsonl from the most recent completed
+      run (git_commit=3a6c771) -- decisive, no new training needed.
+- [ ] Launch a `--utility_ablation linear_projection` run (K=2, same config otherwise) --
+      decisive, cleanly separates "Stage 1 is the bottleneck" from "something downstream is."
+- [ ] Launch (or combine with the above) a run with `--log_reward_components` and check
+      `analyze_reward_spread.py`'s output, especially for `r_speed` given the real z_progress/
+      z_comfort ratio already suggests it may be floor-saturated, not just low.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

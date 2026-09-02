@@ -39,6 +39,7 @@ import yaml
 
 from prism.morl.utility_functions import (
     UtilityFunction,
+    LinearProjectionUtility,
     init_utility_functions_from_preferences,
     train_utility_functions_stage1,
 )
@@ -192,6 +193,7 @@ def _build_env(cfg: dict, hp: dict, utility_fn, zt_normaliser):
         outcome_costs_enabled=cfg.get("outcome_costs_enabled", True),
         active_indicators=cfg.get("active_indicators", None),
         cost_scale=cfg.get("cost_scale", 1.0),
+        log_components=cfg.get("log_reward_components", False),
     )
 
     # Inject env back-reference so the camera builder can resolve the log file path
@@ -352,10 +354,45 @@ def run_stage1(cfg: dict, hp: dict, device: torch.device):
     Returns (utility_fns, preference_vectors).  preference_vectors is a list
     of K lists (one per policy), used by Stage 2 to set w_k on adapters that
     need explicit style conditioning (e.g. AlpamayoAdapter / QFormerCritic).
+
+    cfg["utility_ablation"] == "linear_projection" bypasses everything below
+    and returns pure f_k(z) = z[k] projections instead -- see
+    LinearProjectionUtility's docstring and CHANGES.md for why (Test 2 of
+    the K-policy-divergence investigation). These get saved to
+    stage1/utility_fn_k.pth exactly like normal utility functions, but note
+    inspect_utility_functions.py assumes the real UtilityFunction class's
+    buffers (fc_in, _pref_weights, etc.) and won't produce a meaningful
+    report against these -- not needed anyway, since this ablation's
+    behavior is fully known by construction.
     """
     n_policies = cfg.get("n_policies", 5)
     reward_dim = cfg.get("reward_dim", 4)
     mode = cfg.get("stage1", {}).get("mode", "preferences")
+
+    if cfg.get("utility_ablation", "none") == "linear_projection":
+        assert n_policies <= reward_dim, (
+            f"--utility_ablation linear_projection needs n_policies ({n_policies}) "
+            f"<= reward_dim ({reward_dim}) -- one projection per style dimension, "
+            f"no sensible K+1-th projection."
+        )
+        logger.info(
+            f"[Stage 1] ABLATION: linear_projection -- bypassing Stage 1 entirely, "
+            f"using f_k(z) = z[k] for k=0..{n_policies-1} (see CHANGES.md)."
+        )
+        utility_fns = [
+            LinearProjectionUtility(reward_dim=reward_dim, dim=k).to(device)
+            for k in range(n_policies)
+        ]
+        # One-hot preference vectors matching each projection's own
+        # dimension, so w_k (FiLM actor conditioning) stays consistent with
+        # what the utility function actually rewards -- avoids a mismatched
+        # signal between the reward the policy trains on and the "which
+        # style am I" signal the actor sees.
+        preference_vectors = [
+            [1.0 if i == k else 0.0 for i in range(reward_dim)]
+            for k in range(n_policies)
+        ]
+        return utility_fns, preference_vectors
 
     logger.info(f"[Stage 1] mode={mode}  K={n_policies}  reward_dim={reward_dim}")
 
@@ -566,6 +603,33 @@ def parse_args():
     )
     parser.add_argument("--cache_path", type=str, default=None,
                         help="Override cache_path from config (path to CaRL scenario cache)")
+    parser.add_argument(
+        "--log_reward_components", action="store_true",
+        help=(
+            "Also log raw reward sub-components (r_speed, r_lane, r_dev, "
+            "r_heading, jerk, ttc) per update -- for "
+            "scripts/analyze_reward_spread.py to check whether individual "
+            "pieces are plateauing near their ceiling. Off by default (small "
+            "extra per-step compute + wider metrics.jsonl records). See "
+            "CHANGES.md."
+        ),
+    )
+    parser.add_argument(
+        "--utility_ablation", choices=["none", "linear_projection"], default="none",
+        help=(
+            "Instability-analysis ablation (Test 2 of the K-policy-divergence "
+            "investigation, see CHANGES.md). 'linear_projection' bypasses Stage 1 "
+            "entirely and uses f_k(z) = z[k] for policy k -- a pure one-dimension "
+            "projection with maximally, unambiguously different gradients "
+            "(one-hot, orthogonal everywhere, no saturation possible by "
+            "construction) instead of the learned/preference-biased utility "
+            "functions. Isolates whether Stage 1 utility-function construction "
+            "is why policies aren't diverging more, or whether the problem is "
+            "downstream (PPO, the environment, or the reward formulas "
+            "themselves). Requires n_policies <= reward_dim (one projection per "
+            "style dimension; there's no sensible K+1-th projection)."
+        ),
+    )
     # ── Backbone phase (Alpamayo experiment) ─────────────────────────────────
     parser.add_argument(
         "--model-backend", choices=["carl_ppo", "alpamayo"], default=None,
@@ -620,6 +684,10 @@ def main():
         cfg["seed"] = args.seed
     if args.cache_path:
         cfg["cache_path"] = args.cache_path
+    if args.utility_ablation != "none":
+        cfg["utility_ablation"] = args.utility_ablation
+    if args.log_reward_components:
+        cfg["log_reward_components"] = True
 
     # ── Backbone phase (Alpamayo only) ────────────────────────────────────────
     backbone_phase = args.backbone_phase  # "a", "b", or None

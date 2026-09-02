@@ -418,3 +418,60 @@ def init_utility_functions_from_preferences(
         ufs.append(uf)
 
     return ufs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ablation: pure linear projection utility (Test 2 of the K-policy-
+# divergence investigation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LinearProjectionUtility(nn.Module):
+    """
+    Ablation utility function: f(z) = z[dim] exactly -- a pure projection
+    onto one style dimension, bypassing ALL of UtilityFunction's learned/
+    preference-biased machinery (no monotone network, no input/output
+    normalisation, no linear-term blending).
+
+    Purpose: isolate whether Stage 1 utility-function CONSTRUCTION is why K
+    policies aren't diverging more, or whether the problem is downstream
+    (PPO, the environment, or the reward formulas themselves). This
+    function's gradient is maximally, unambiguously different from any
+    other dimension's projection -- nabla f_k is a one-hot vector at index
+    k, orthogonal to every other dimension's projection EVERYWHERE in R^4,
+    with no saturation and no shared-direction confound possible by
+    construction (contrast with check_gradient_alignment.py's finding for
+    the learned/preference-biased functions). If two policies still don't
+    diverge under this, Stage 1 isn't the bottleneck.
+
+    Side effect worth knowing: this also collapses R_t back to the raw
+    per-step reward component exactly. Since PRISMEnv updates
+    z_{t+1} = z_t + gamma^t * r_vec, z_{t+1}[dim] - z_t[dim] =
+    gamma^t * r_vec[dim]_t, so R_t = gamma^{-t} * (f(z_{t+1}) - f(z_t)) =
+    r_vec[dim]_t -- i.e. this ablation is simultaneously a test of "does PPO
+    on the RAW per-step reward component alone, with no DPMORL wrapping at
+    all, produce divergence." See CHANGES.md.
+    """
+
+    def __init__(self, reward_dim: int, dim: int) -> None:
+        super().__init__()
+        assert 0 <= dim < reward_dim, f"dim={dim} out of range for reward_dim={reward_dim}"
+        self._reward_dim = reward_dim
+        self._dim = dim
+        # No real parameters -- a dummy buffer so state_dict()/
+        # load_state_dict() (used by checkpointing, same path as
+        # UtilityFunction) aren't operating on an empty module, and so
+        # .to(device) has something to anchor placement to.
+        self.register_buffer("_dummy", torch.zeros(1))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if z.dim() == 1:
+            return z[self._dim]
+        return z[:, self._dim]
+
+    def as_callable(self):
+        def _fn(z: np.ndarray) -> float:
+            return float(z[self._dim])
+        return _fn
+
+    def set_preference(self, pref) -> None:
+        pass  # no-op -- no preference-weighted term exists to set here

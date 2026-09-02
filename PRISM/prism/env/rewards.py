@@ -35,24 +35,16 @@ def compute_comfort(j_lon: float, j_lat: float, sigma_j_sq: float) -> float:
     return float(math.exp(-jerk_sq / max(sigma_j_sq, 1e-8)))
 
 
-def compute_progress(
+def _progress_components(
     v_ego: float,
     v_des: float,
     lane_index: int,
     n_lanes: int,
     beta: float,
-) -> float:
-    """
-    Eq. (progress) in paper.
-    r_progress = r_speed * (0.5 + 0.5 * r_lane)
-
-    No longer includes an acceleration factor (see CHANGES.md): |a_ego|
-    rewarded acceleration magnitude unconditionally, which structurally
-    punished steady-state cruising at v_des (already fully rewarded by
-    r_speed) and fought r_comfort's jerk-minimisation goal. Assertiveness
-    (closing a speed gap quickly) is already captured by r_speed accumulated
-    over time via z_t/R_t, without a separate term.
-    """
+) -> tuple:
+    """Shared by compute_progress() and compute_style_rewards_verbose() so
+    there's exactly one implementation of the formula -- returns
+    (r_speed, r_lane) rather than the combined scalar."""
     # Speed sub-reward: penalise shortfall from desired speed
     v_des_safe = max(v_des, 0.5)  # avoid division by zero
     shortfall = max(0.0, v_des_safe - v_ego)
@@ -71,7 +63,47 @@ def compute_progress(
     else:
         r_lane = float(lane_index) / float(n_lanes - 1)
 
+    return r_speed, r_lane
+
+
+def compute_progress(
+    v_ego: float,
+    v_des: float,
+    lane_index: int,
+    n_lanes: int,
+    beta: float,
+) -> float:
+    """
+    Eq. (progress) in paper.
+    r_progress = r_speed * (0.5 + 0.5 * r_lane)
+
+    No longer includes an acceleration factor (see CHANGES.md): |a_ego|
+    rewarded acceleration magnitude unconditionally, which structurally
+    punished steady-state cruising at v_des (already fully rewarded by
+    r_speed) and fought r_comfort's jerk-minimisation goal. Assertiveness
+    (closing a speed gap quickly) is already captured by r_speed accumulated
+    over time via z_t/R_t, without a separate term.
+    """
+    r_speed, r_lane = _progress_components(
+        v_ego=v_ego, v_des=v_des, lane_index=lane_index, n_lanes=n_lanes, beta=beta
+    )
     return float(r_speed * (0.5 + 0.5 * r_lane))
+
+
+def _lateral_components(
+    d_lat: float,
+    delta_psi: float,
+    sigma_d: float,
+    phi: float,
+) -> tuple:
+    """Shared by compute_lateral_discipline() and
+    compute_style_rewards_verbose() -- returns (r_dev, r_heading)."""
+    sigma_d_safe = max(sigma_d, 1e-4)
+    phi_safe = max(phi, 1e-4)
+
+    r_dev = 0.3 + 0.7 * math.exp(-((d_lat / sigma_d_safe) ** 2))
+    r_heading = math.exp(-(((abs(delta_psi)) / phi_safe) ** 2))
+    return r_dev, r_heading
 
 
 def compute_lateral_discipline(
@@ -86,11 +118,9 @@ def compute_lateral_discipline(
     r_dev     = 0.3 + 0.7 * exp(-(d_lat / sigma_d)^2)
     r_heading = exp(-(|delta_psi| / phi)^2)
     """
-    sigma_d_safe = max(sigma_d, 1e-4)
-    phi_safe = max(phi, 1e-4)
-
-    r_dev = 0.3 + 0.7 * math.exp(-((d_lat / sigma_d_safe) ** 2))
-    r_heading = math.exp(-(((abs(delta_psi)) / phi_safe) ** 2))
+    r_dev, r_heading = _lateral_components(
+        d_lat=d_lat, delta_psi=delta_psi, sigma_d=sigma_d, phi=phi
+    )
     return float(r_dev * r_heading)
 
 
@@ -182,3 +212,65 @@ def compute_style_rewards(
     r_spacing = compute_spacing(ttc=ttc, tau=scaling["tau"])
 
     return np.array([r_comfort, r_progress, r_lateral, r_spacing], dtype=np.float32)
+
+
+def compute_style_rewards_verbose(
+    j_lon: float,
+    j_lat: float,
+    v_ego: float,
+    v_des: float,
+    lane_index: int,
+    n_lanes: int,
+    d_lat: float,
+    delta_psi: float,
+    d_lead: float,
+    v_lead: float,
+    has_lead: bool,
+    hp: Dict,
+):
+    """
+    Same computation as compute_style_rewards(), but also returns the raw
+    sub-components each dimension is built from -- for diagnosing whether
+    an individual piece (not just the combined 4D vector) is plateauing /
+    saturating near its ceiling with little room left to differentiate
+    between actions, independent of anything happening in PPO training.
+    Opt-in only (PRISMRewardBuilder's log_components flag) -- not used on
+    the default hot training path, since it does a bit of extra work
+    (recomputes r_progress/r_lateral by hand rather than reusing
+    compute_progress/compute_lateral_discipline's single combined return)
+    for the sole purpose of exposing the intermediates. See
+    scripts/analyze_reward_spread.py and CHANGES.md.
+
+    Returns (r_vec, components) where r_vec is identical to
+    compute_style_rewards()'s return, and components is a dict of raw
+    sub-component values (ttc is None, not inf, when there's no lead
+    vehicle or ego isn't closing -- json.dumps can't serialise inf/nan).
+    """
+    scaling = hp["reward_scaling"]
+
+    r_comfort = compute_comfort(j_lon=j_lon, j_lat=j_lat, sigma_j_sq=scaling["sigma_j_sq"])
+
+    r_speed, r_lane = _progress_components(
+        v_ego=v_ego, v_des=v_des, lane_index=lane_index, n_lanes=n_lanes, beta=scaling["beta"]
+    )
+    r_progress = float(r_speed * (0.5 + 0.5 * r_lane))
+
+    r_dev, r_heading = _lateral_components(
+        d_lat=d_lat, delta_psi=delta_psi, sigma_d=scaling["sigma_d"], phi=scaling["phi"]
+    )
+    r_lateral = float(r_dev * r_heading)
+
+    ttc = compute_ttc(d_lead=d_lead, v_ego=v_ego, v_lead=v_lead, has_lead=has_lead)
+    r_spacing = compute_spacing(ttc=ttc, tau=scaling["tau"])
+
+    r_vec = np.array([r_comfort, r_progress, r_lateral, r_spacing], dtype=np.float32)
+    components = {
+        "jerk_lon": float(j_lon),
+        "jerk_lat": float(j_lat),
+        "r_speed": float(r_speed),
+        "r_lane": float(r_lane),
+        "r_dev": float(r_dev),
+        "r_heading": float(r_heading),
+        "ttc": float(ttc) if math.isfinite(ttc) else None,
+    }
+    return r_vec, components

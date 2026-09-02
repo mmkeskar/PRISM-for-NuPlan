@@ -67,7 +67,7 @@ from shapely.geometry import Point
 
 # ── PRISM imports ─────────────────────────────────────────────────────────────
 from prism.env.regime_detector import RegimeDetector, RegimeResult
-from prism.env.rewards import compute_style_rewards
+from prism.env.rewards import compute_style_rewards, compute_style_rewards_verbose
 from prism.env.safety_cost import SafetyCostBuilder, SafetyCostComponents
 from prism.utils.zt_normaliser import ZtNormaliser
 
@@ -102,12 +102,21 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         terminate_on_off_road: bool = True,
         outcome_costs_enabled: bool = True,
         active_indicators: Optional[list] = None,
+        log_components: bool = False,
     ) -> None:
         self._area = environment_area
         self._hp = hp
         self._regime = regime_detector
         self._terminate_collision = terminate_on_collision
         self._terminate_off_road = terminate_on_off_road
+        # Instability-analysis diagnostic (not on by default -- see
+        # compute_style_rewards_verbose()): when set, build_reward() also
+        # computes and exposes raw reward sub-components (r_speed, r_lane,
+        # r_dev, r_heading, jerk, ttc) via info["reward_components"], for
+        # scripts/analyze_reward_spread.py to check whether individual
+        # pieces are plateauing near their ceiling, independent of anything
+        # PPO training is doing. See CHANGES.md.
+        self._log_components = log_components
 
         self._safety = SafetyCostBuilder(
             hp,
@@ -209,20 +218,37 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         had_wrong_direction = self._check_wrong_direction(ego_state, current_lane)
 
         # ── Style rewards ─────────────────────────────────────────────────
-        r_vec = compute_style_rewards(
-            j_lon=j_lon,
-            j_lat=j_lat,
-            v_ego=v_ego,
-            v_des=regime_result.v_des,
-            lane_index=lane_index,
-            n_lanes=n_lanes,
-            d_lat=d_lat,
-            delta_psi=delta_psi,
-            d_lead=regime_result.d_lead,
-            v_lead=regime_result.v_lead,
-            has_lead=regime_result.has_lead,
-            hp=self._hp,
-        )
+        if self._log_components:
+            r_vec, reward_components = compute_style_rewards_verbose(
+                j_lon=j_lon,
+                j_lat=j_lat,
+                v_ego=v_ego,
+                v_des=regime_result.v_des,
+                lane_index=lane_index,
+                n_lanes=n_lanes,
+                d_lat=d_lat,
+                delta_psi=delta_psi,
+                d_lead=regime_result.d_lead,
+                v_lead=regime_result.v_lead,
+                has_lead=regime_result.has_lead,
+                hp=self._hp,
+            )
+            info["reward_components"] = reward_components
+        else:
+            r_vec = compute_style_rewards(
+                j_lon=j_lon,
+                j_lat=j_lat,
+                v_ego=v_ego,
+                v_des=regime_result.v_des,
+                lane_index=lane_index,
+                n_lanes=n_lanes,
+                d_lat=d_lat,
+                delta_psi=delta_psi,
+                d_lead=regime_result.d_lead,
+                v_lead=regime_result.v_lead,
+                has_lead=regime_result.has_lead,
+                hp=self._hp,
+            )
 
         # ── Safety cost ───────────────────────────────────────────────────
         cost_comp: SafetyCostComponents = self._safety.compute(
@@ -538,6 +564,7 @@ def make_prism_env(
     outcome_costs_enabled: bool = True,
     active_indicators: Optional[list] = None,
     cost_scale: float = 1.0,
+    log_components: bool = False,
 ) -> PRISMEnv:
     """
     Build a ready-to-use PRISMEnv from the standard CaRL builder objects.
@@ -551,6 +578,10 @@ def make_prism_env(
             "ttc", "thw", "speed", "blind_spot", "red_light") contribute to
             c_t. Flags for excluded indicators are still set for logging.
         cost_scale: uniform multiplier applied to c_t before it feeds e_t.
+        log_components: if True, PRISMRewardBuilder also exposes raw reward
+            sub-components (r_speed, r_lane, r_dev, r_heading, jerk, ttc)
+            via info["reward_components"] -- see
+            compute_style_rewards_verbose() and CHANGES.md.
     """
     regime_detector = RegimeDetector(
         congestion_speed_fraction=hp.get("regime_detection", {}).get(
@@ -566,6 +597,7 @@ def make_prism_env(
         regime_detector=regime_detector,
         outcome_costs_enabled=outcome_costs_enabled,
         active_indicators=active_indicators,
+        log_components=log_components,
     )
     return PRISMEnv(
         scenario_sampler=scenario_sampler,

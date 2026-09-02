@@ -383,6 +383,12 @@ class DPMORLTrainer:
             # capability signal, distinct from length alone (a stationary
             # policy can also produce long episodes without driving well).
             local_episode_outcomes: List[str] = []
+            # Raw reward sub-components (r_speed, r_lane, r_dev, r_heading,
+            # jerk, ttc) THIS update, one dict per step -- only populated
+            # when PRISMRewardBuilder's log_components flag is on
+            # (cfg["log_reward_components"], off by default). See
+            # compute_style_rewards_verbose() and CHANGES.md.
+            local_reward_components: List[dict] = []
             current_ep_id = 0
             current_ep_len = 0
 
@@ -399,6 +405,9 @@ class DPMORLTrainer:
 
                 c_t = float(info.get("safety_cost", 0.0))
                 episode_step_costs.append(c_t)
+
+                if "reward_components" in info:
+                    local_reward_components.append(info["reward_components"])
 
                 self._buffer.obs.append({
                     k: v.squeeze(0).cpu().numpy()
@@ -526,6 +535,23 @@ class DPMORLTrainer:
                 )
                 z_stats = {f"z_{name}": float(v) for name, v in zip(names, mean_zt)}
 
+            # Per-step reward sub-component distribution THIS update (mean/
+            # std) -- only populated when log_reward_components is on (see
+            # local_reward_components above). Purpose: check whether an
+            # individual piece (e.g. r_speed) is sitting near its ceiling
+            # with little spread left to differentiate actions,
+            # independent of anything PPO training is doing. std=0.0 is
+            # reported as-is (a genuinely saturated component), not omitted
+            # -- that's the actual finding this diagnostic exists to catch.
+            component_stats = {}
+            if local_reward_components:
+                keys = local_reward_components[0].keys()
+                for key in keys:
+                    vals = [d[key] for d in local_reward_components if d.get(key) is not None]
+                    if vals:
+                        component_stats[f"rc_{key}_mean"] = float(np.mean(vals))
+                        component_stats[f"rc_{key}_std"] = float(np.std(vals))
+
             mean_reward_this_update = (
                 float(np.mean(self._buffer.rewards)) if self._buffer.rewards else None
             )
@@ -575,6 +601,7 @@ class DPMORLTrainer:
                 "std_reward_this_update": std_reward_this_update,
                 **z_stats,
                 **outcome_stats,
+                **component_stats,
                 "total_loss": loss_info["total_loss"],
                 "v_loss": loss_info["v_loss"],
                 "entropy": loss_info["entropy"],
