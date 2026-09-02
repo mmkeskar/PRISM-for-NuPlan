@@ -52,12 +52,28 @@ class UtilityFunction(nn.Module):
         max_weight: float = 1.0,
         lamda: float = 0.05,
         normalization_warmup_calls: int = 50_000,
+        output_scale: float = 16.0,
     ) -> None:
         super().__init__()
         self._reward_dim = reward_dim
         self._n_hidden = n_hidden
         self._max_weight = max_weight
         self._lamda = lamda
+        # Output self-normalisation (see forward()) correctly bounds f(z) to
+        # ~[0,1], but that also removed an UNINTENTIONAL scale inflation the
+        # old, unbounded output had (an unconstrained output bias could push
+        # raw output arbitrarily large). ent_coef/vf_coef/learning_rate were
+        # all tuned against that old, larger scale. Measured directly (real
+        # training run + offline simulated trajectory, same order of
+        # magnitude in both): per-step utility deltas are ~16-17x smaller
+        # after the corner-normalisation fix. Restoring that scale here
+        # (applied AFTER normalisation + the lamda blend, so it preserves
+        # the now-correct relative shape/differentiation and only rescales
+        # magnitude) avoids re-tuning every downstream hyperparameter. 16.0
+        # is a reasoned starting point from that measurement, not a
+        # precisely calibrated value -- may need further tuning, same as
+        # ent_coef's own history in this project. See CHANGES.md.
+        self._output_scale = output_scale
         # _min_val/_max_val (registered below) stop updating once this many
         # forward() calls have been seen -- previously updated on EVERY
         # call, forever, for the entire run (not just early on): the same
@@ -182,7 +198,11 @@ class UtilityFunction(nn.Module):
         # term dominating purely because it happened to be numerically
         # larger (the >99% figure above). See CHANGES.md.
         linear_term = (x * self._pref_weights).sum(dim=-1)  # (B,)
-        out = (1.0 - self._lamda) * net_out + self._lamda * linear_term  # (B,)
+        out = (1.0 - self._lamda) * net_out + self._lamda * linear_term  # (B,), in ~[0,1]
+
+        # Restore the scale downstream hyperparameters were tuned against
+        # (see __init__ for why this is needed, not just cosmetic).
+        out = out * self._output_scale
 
         if squeeze:
             return out.squeeze(0)  # scalar

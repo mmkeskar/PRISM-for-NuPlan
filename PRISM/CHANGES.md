@@ -1573,3 +1573,65 @@ comparable scale, so `lamda` actually controls their relative contribution as in
       concern somewhat, but it's still worth being precise in the paper about what's actually
       being compared.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-02 — `UtilityFunction` output scale collapsed after the normalisation fix; added `output_scale`
+
+### Motivation
+
+Real run (git_commit=a57ec50, i.e. the r_progress/r_lane fix + ent_coef decay + call-caching +
+output self-normalisation all together, stopped at update ~3600/5000) showed a regression, not
+the expected improvement: policy_0's entropy went flat (~1.7-1.8 the whole run, not decreasing)
+and policy_1's entropy climbed from ~1.9 to ~2.9-3.0 -- worse than either prior run, including the
+one *before* ent_coef decay was added. `z_T` trends confirmed this wasn't cosmetic: policy_1
+declined on all four style dimensions, and the progress-divergence that had appeared in the
+previous run (policy_1 beating policy_0 on `z_progress`) collapsed to a near-tie (11.53 vs 11.59).
+
+Root cause, confirmed both from the real run's data and an offline simulated-trajectory
+comparison (old formula vs. new formula, same network, same z trajectory): the previous entry's
+output-normalisation fix correctly bounded `f(z)` to `~[0,1]`, but that also removed an
+UNINTENTIONAL scale inflation the old, unbounded output had (an unconstrained output bias --
+neither implementation clamps it, see previous entry -- could push raw output arbitrarily large).
+Measured: per-step utility deltas are ~16-17x smaller after the fix (offline: 0.087 -> 0.005 mean
+absolute delta on a realistic simulated trajectory; the real run's `reward_advantage_std` dropped
+by a consistent ~15-20x for both policies). `ent_coef`, `vf_coef`, and `learning_rate` were all
+tuned against the old, larger (if unintentional) scale. Since the run was stopped at ~72% of its
+schedule, `ent_coef` had only decayed to ~28% of its initial value by then -- so even with decay
+active, the entropy-bonus-to-reward-signal ratio got roughly 5x MORE entropy-dominant than before
+(reward shrank ~17x, ent_coef only shrank ~3.6x by that point), which is exactly why entropy
+failed to decrease instead of improving further.
+
+### Change
+
+`prism/morl/utility_functions.py`: added `output_scale: float = 16.0` to `UtilityFunction.__init__`,
+applied as a final multiplier on `out` after the corner-normalisation + lamda blend (so it
+preserves the now-correct relative shape/differentiation from the previous entry, and only
+restores absolute magnitude). 16.0 is a reasoned value from the measured ~16-17x ratio, not a
+precisely calibrated one -- may need further tuning, same as `ent_coef`'s own history in this
+project.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing.
+- Offline: re-ran the same old-vs-new simulated-trajectory comparison from the previous entry with
+  `output_scale=16.0` applied -- ratio is now ~1.01-1.09x (old and new are essentially the same
+  scale), down from ~16-17x before this fix.
+- Offline: telescoping identity `sum(gamma^t * R_t) == f(z_T) - f(z_0)` still holds exactly
+  (diff=0.00e+00) with the scale factor applied (a constant multiplier on `f` doesn't affect
+  telescoping, confirmed rather than assumed).
+- Not yet run against a real training run -- next step.
+
+### Outstanding
+
+- [ ] Run DPMORL-only again with `output_scale=16.0` and confirm entropy decreases cleanly for
+      both policies through the full 5000-update schedule this time (this is now the 3rd distinct
+      mechanism targeting this class of problem -- log_std clamp, ent_coef floor/decay, and now
+      reward-scale calibration -- each of which was individually well-justified and empirically
+      verified offline, but the interaction between them wasn't fully anticipated until seeing
+      real training data. Worth watching closely rather than assuming this closes it out.)
+- [ ] If entropy is still not cleanly decreasing with output_scale=16.0, the next lever is
+      `output_scale` itself (try a somewhat larger value) rather than another change to `ent_coef`
+      -- the analysis above suggests scale mismatch, not an incorrectly-shaped decay schedule, was
+      the actual problem.
+- [ ] Everything else from prior entries' Outstanding sections still applies.
