@@ -1740,3 +1740,87 @@ threshold).
       `analyze_reward_spread.py`'s output, especially for `r_speed` given the real z_progress/
       z_comfort ratio already suggests it may be floor-saturated, not just low.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-02 (cont.) — Test 1 result; `--skip_stage1` gap for the linear_projection ablation
+
+### Test 1 result: root cause found, no training needed
+
+Ran `check_gradient_alignment.py` against the real K=2 checkpoints + metrics.jsonl (git_commit=
+3a6c771). Result: cosine similarity between nabla f_0(z) and nabla f_1(z) is essentially CONSTANT
+across all 2000 real z points sampled -- mean=0.8069, std=0.0054 (min=0.7978, max=0.8175). That
+tight a clustering, independent of where in the reachable region z falls, points away from
+"saturation at specific points" and toward "the two functions are just not different enough,
+globally, by construction."
+
+Confirmed algebraically: the K=2 generic-fallback preference vectors from `_get_preference_vectors()`
+are `[0.4231, 0.1923, 0.1923, 0.1923]` (policy 0) and `[0.1923, 0.4231, 0.1923, 0.1923]` (policy 1).
+Their cosine similarity, computed directly: 0.8164 -- matching the measured ~0.807 almost exactly
+(the small gap is the residual, now-meaningful neural pathway's own contribution, on top of the
+still-dominant linear term). The two vectors are structurally similar because the fallback formula
+(`base = 1/reward_dim` for every dimension, `+0.4*(1-1/reward_dim)` added to ONLY the policy's own
+dimension, then renormalised) leaves the OTHER `reward_dim - 1` dimensions identical between any
+two policies -- for K=2, policies 0 and 1 share IDENTICAL weight (0.1923) on both the lateral and
+spacing dimensions, and differ only in which ONE dimension gets the boost. That structurally caps
+how different two K=2 preference vectors from this formula can ever be, regardless of anything
+about PPO, the environment, or reward formulas.
+
+This is a clean, load-bearing finding: the divergence weakness traces to Stage 1's preference-
+vector CONSTRUCTION for non-curated K (the generic fallback, used for K=2; the curated K=4/K=5
+lists don't have this problem, since they're hand-picked, not formula-generated). Not yet fixed --
+candidate fix is a fallback formula that also SUPPRESSES weight on other dimensions when boosting
+one, not just adds to one while leaving the rest untouched (e.g. redistribute the boost's cost
+across the other dimensions rather than only growing the numerator), making the K=2 case closer in
+spirit to the curated lists' more differentiated vectors. Needs discussion before implementing --
+this affects the ALREADY-COMPLETED K=2 runs' interpretation (their divergence weakness has a
+concrete, non-buggy explanation now) and needs to be weighed against just moving to a curated K=4
+run instead, where this specific formula isn't used at all.
+
+### Bug found via a real run: `--skip_stage1 --utility_fn_dir` didn't handle the ablation
+
+User's attempt to launch `--utility_ablation linear_projection` crashed on an unrelated
+`--cache_path` issue (ran the raw command by hand, without the Makefile's `--cache_path`/
+`--nuplan_data_root`/`--output_dir`, which resolve from `lab.env`; the config file's own
+`cache_path` default, `/data/prism_cache`, doesn't exist on this machine -- `/data/prism_mini_cache`,
+which the Makefile always supplies, does). That crash happened before reaching Stage 2, but it
+surfaced a real, separate bug in the process: `run_stage1()`'s ablation branch (previous entry)
+was fixed, but the OTHER path that constructs utility functions --
+`main()`'s `elif args.skip_stage1 and args.utility_fn_dir:` branch, used by the Makefile's
+`*-mini-parallel` targets' per-policy concurrent processes -- unconditionally tried to
+`UtilityFunction().load_state_dict(...)` against the ablation's saved checkpoint, which only ever
+contains `LinearProjectionUtility`'s single dummy buffer. Would have raised a missing-keys error
+on the very next step of the same launch. Fixed: this branch now also checks
+`cfg["utility_ablation"]` and reconstructs `LinearProjectionUtility` directly (no state to load --
+it's fully determined by `reward_dim`/`dim` alone), matching `run_stage1()`'s own branch exactly
+(same one-hot `preference_vectors`).
+
+Also added `UTILITY_ABLATION`/`LOG_REWARD_COMPONENTS` optional Makefile variables to
+`train-dpmorl-only-mini-parallel`, threaded into both the `--stage1_only` call and every per-policy
+parallel call, so the ablation/logging flags don't need to be hand-assembled against `lab.env`'s
+resolved paths ever again:
+```
+make train-dpmorl-only-mini-parallel UTILITY_ABLATION=linear_projection LOG_REWARD_COMPONENTS=1
+```
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing.
+- Offline: reconstructed the `--skip_stage1 --utility_fn_dir` ablation branch's logic directly
+  (stage1_only save -> reconstruct, matching what the Makefile's two-phase launch actually does)
+  and confirmed `f_k(z) = z[k]` still holds exactly after the round trip.
+- `make -n train-dpmorl-only-mini-parallel UTILITY_ABLATION=linear_projection LOG_REWARD_COMPONENTS=1`
+  (dry run) confirms both flags land correctly in both the stage1_only call and the per-policy
+  parallel calls; the same dry run with neither variable set is byte-identical to the pre-existing
+  target (no regression).
+
+### Outstanding
+
+- [ ] Decide on a fix for the K=2 fallback preference-vector formula (see Test 1 finding above)
+      before relying on any further K=2 "preferences"-mode results -- or switch straight to a
+      curated K=4 run, which doesn't hit this formula at all.
+- [ ] Re-launch the linear_projection ablation via
+      `make train-dpmorl-only-mini-parallel UTILITY_ABLATION=linear_projection LOG_REWARD_COMPONENTS=1`
+      now that both the cache-path issue (user error, not a bug) and the `--skip_stage1` gap
+      (real bug, now fixed) are resolved.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

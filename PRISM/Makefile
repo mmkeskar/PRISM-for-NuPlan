@@ -237,6 +237,12 @@ N_POLICIES ?= $(shell $(PYTHON) -c "import yaml; print(yaml.safe_load(open('conf
 DPMORL_ONLY_OUT := runs/dpmorl_only
 DPMORL_ONLY_EXP := prism_dpmorl_only_001
 
+# Optional instability-analysis ablation passthrough (see CHANGES.md), e.g.:
+#   make train-dpmorl-only-mini-parallel UTILITY_ABLATION=linear_projection LOG_REWARD_COMPONENTS=1
+UTILITY_ABLATION ?=
+LOG_REWARD_COMPONENTS ?=
+ABLATION_FLAGS := $(if $(UTILITY_ABLATION),--utility_ablation $(UTILITY_ABLATION)) $(if $(LOG_REWARD_COMPONENTS),--log_reward_components)
+
 train-dpmorl-only-mini-parallel:
 	@echo "── DPMORL-only experiment: Stage 1, then $(N_POLICIES) polic$(if $(filter 1,$(N_POLICIES)),y,ies) as concurrent processes ──"
 	$(PYTHON) scripts/train.py \
@@ -245,6 +251,7 @@ train-dpmorl-only-mini-parallel:
 	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
 	    --cache_path  $(MINI_CACHE_PATH) \
 	    --output_dir  $(DPMORL_ONLY_OUT) \
+	    $(ABLATION_FLAGS) \
 	    --stage1_only
 	@echo "── Stage 1 done. Launching policy_ids 0..$$(($(N_POLICIES)-1)) concurrently -- logs in $(DPMORL_ONLY_OUT)/policy_*.log ──"
 	@for k in $$(seq 0 $$(($(N_POLICIES)-1))); do \
@@ -256,6 +263,7 @@ train-dpmorl-only-mini-parallel:
 	        --output_dir  $(DPMORL_ONLY_OUT) \
 	        --skip_stage1 \
 	        --utility_fn_dir $(DPMORL_ONLY_OUT)/$(DPMORL_ONLY_EXP)/stage1 \
+	        $(ABLATION_FLAGS) \
 	        --policy_ids $$k > $(DPMORL_ONLY_OUT)/policy_$$k.log 2>&1 & \
 	done; \
 	wait; \

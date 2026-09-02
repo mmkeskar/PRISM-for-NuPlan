@@ -760,15 +760,43 @@ def main():
         preference_vectors = _get_preference_vectors(n_policies, reward_dim)
 
     elif args.skip_stage1 and args.utility_fn_dir:
-        logger.info("[Stage 1] Skipped. Loading pre-saved utility functions.")
-        utility_fns = []
-        for k in range(n_policies):
-            uf = UtilityFunction(reward_dim=reward_dim)
-            uf_path = Path(args.utility_fn_dir) / f"utility_fn_{k}.pth"
-            uf.load_state_dict(torch.load(uf_path, map_location=device))
-            uf.to(device)
-            utility_fns.append(uf)
-        preference_vectors = _get_preference_vectors(n_policies, reward_dim)
+        if cfg.get("utility_ablation", "none") == "linear_projection":
+            # LinearProjectionUtility has no learned state (fully determined
+            # by reward_dim/dim alone) -- reconstruct directly rather than
+            # trying to load its trivial checkpoint into a real
+            # UtilityFunction, which would fail (missing keys) since the
+            # ablation's checkpoints only ever contain the class's dummy
+            # buffer. Matches run_stage1()'s own ablation branch exactly
+            # (same one-hot preference_vectors), so a --stage1_only run
+            # followed by concurrent --skip_stage1 --policy_ids processes
+            # (see Makefile's *-parallel targets) works under this ablation
+            # too. See CHANGES.md.
+            assert n_policies <= reward_dim, (
+                f"--utility_ablation linear_projection needs n_policies "
+                f"({n_policies}) <= reward_dim ({reward_dim})."
+            )
+            logger.info(
+                "[Stage 1] Skipped. Reconstructing linear_projection ablation "
+                "utility functions directly (no learned state to load)."
+            )
+            utility_fns = [
+                LinearProjectionUtility(reward_dim=reward_dim, dim=k).to(device)
+                for k in range(n_policies)
+            ]
+            preference_vectors = [
+                [1.0 if i == k else 0.0 for i in range(reward_dim)]
+                for k in range(n_policies)
+            ]
+        else:
+            logger.info("[Stage 1] Skipped. Loading pre-saved utility functions.")
+            utility_fns = []
+            for k in range(n_policies):
+                uf = UtilityFunction(reward_dim=reward_dim)
+                uf_path = Path(args.utility_fn_dir) / f"utility_fn_{k}.pth"
+                uf.load_state_dict(torch.load(uf_path, map_location=device))
+                uf.to(device)
+                utility_fns.append(uf)
+            preference_vectors = _get_preference_vectors(n_policies, reward_dim)
 
     else:
         utility_fns, preference_vectors = run_stage1(cfg, hp, device)
