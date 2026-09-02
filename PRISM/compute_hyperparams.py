@@ -487,8 +487,21 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     Compute scaling parameters for all four reward functions.
 
     sigma_j_sq : Var(j_lon^2 + j_lat^2)
-    beta       : set so 1-sigma shortfall -> reward = e^{-1}
-                 i.e. beta = 1.0 (normalised shortfall is already in [0,1])
+    beta       : set so mean shortfall fraction (under EXPERT driving) ->
+                 reward = e^{-1}, i.e. beta = mean((v_des-v_ego)+ / v_des).
+                 Previously a hand-picked constant (0.5, "so a 50% shortfall
+                 -> e^{-1}") -- the ONE reward-scaling parameter here that
+                 wasn't calibrated from real data, unlike every other one
+                 below. Root-caused via the instability-analysis branch
+                 (see CHANGES.md): real DPMORL-only runs show z_progress
+                 sitting far lower, relative to its own achievable ceiling,
+                 than z_comfort/z_lateral/z_spacing -- an uncalibrated beta
+                 was a live candidate explanation, since a policy could be
+                 driving at genuinely expert-comparable competence yet still
+                 get systematically low r_speed if 0.5 doesn't match what
+                 real (expert) driving's typical shortfall actually looks
+                 like. This calibrates it the same way as gamma_a/phi/tau
+                 below, rather than resolving the question by guesswork.
     gamma_a    : set so mean |a_ego| -> reward = 1 - e^{-1} ~ 0.63
                  i.e. gamma_a = mean(|a_ego|)
     phi        : set so 1-sigma |delta_psi| -> reward = e^{-1}
@@ -502,6 +515,17 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     all_delta_psi = np.concatenate([np.abs(ep["delta_psi"]) for ep in episodes])
     all_ttc       = np.concatenate([ep["ttc"][ep["ttc"] < 10]
                                      for ep in episodes])
+    # Shortfall fraction, same "(v_des - v_ego) clamped at 0, over v_des"
+    # quantity compute_progress()'s r_speed itself uses -- computed here
+    # from EXPERT rollouts (this whole function only ever runs against
+    # collect_expert_rollouts() output) rather than from an RL policy's own
+    # (possibly still-learning, possibly genuinely more conservative)
+    # driving, so this calibrates against a real competence baseline, not
+    # against whatever an in-training policy happens to be doing.
+    all_shortfall_frac = np.concatenate([
+        np.maximum(0.0, ep["v_des"] - ep["v_ego"]) / np.maximum(ep["v_des"], 0.5)
+        for ep in episodes
+    ])
 
     sigma_j_sq = float(np.var(all_jerk_sq))
     # Avoid division by zero
@@ -516,9 +540,8 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     tau = float(np.mean(all_ttc)) if len(all_ttc) > 0 else 2.0
     tau = max(tau, 0.1)
 
-    # beta: normalised speed shortfall is already unit-free;
-    # set beta = 0.5 so a 50% shortfall -> reward = e^{-1}
-    beta = 0.5
+    beta = float(np.mean(all_shortfall_frac))
+    beta = max(beta, 1e-3)
     sigma_d = 0.2  # tolerance width for lateral deviation following lane keeping data W. Zhang et al., “Empirical performance evaluation of lane keeping assistance systems,” arXiv preprint arXiv:2505.11534, 2025.
 
     return {

@@ -1888,3 +1888,75 @@ K=2 setup, left as a known gap for if/when K=3 is ever used.
       still limit policy_1 specifically even with better-separated utility functions. Don't
       over-read a clean or a messy result in isolation from those other still-open threads.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-02 (cont.) — `beta` calibration: uncalibrated vs. every other reward-scaling parameter
+
+### Motivation
+
+User asked directly: comfort/lateral/spacing's z_T sit consistently high (~70-80) while
+z_progress sits low (~11-14) in every real run this session -- shouldn't they be on comparable
+scales? Investigated `compute_hyperparams.py`'s `compute_reward_scaling()`: `sigma_j_sq`,
+`gamma_a`, `phi`, `tau` are ALL calibrated from real expert rollout data with an explicit target
+("mean |a_ego| -> reward = 1-e^{-1}", etc.) -- `beta` (the `r_speed` shortfall scale) was the
+ONE exception, hardcoded to `0.5` with a comment justifying the choice in the abstract but never
+checked against real driving data.
+
+### Change
+
+`compute_reward_scaling()` now calibrates `beta` the same way as the others:
+`beta = mean((v_des - v_ego)+ / v_des)` over expert rollouts -- the exact same shortfall-fraction
+quantity `compute_progress()`'s `r_speed` itself uses, computed from `collect_expert_rollouts()`
+output (already collects `v_ego`/`v_des` per timestep, no new data collection needed). This
+mirrors `gamma_a`'s calibration pattern exactly (mean of the raw quantity -> reward = e^{-1} at
+that mean).
+
+### Important honest caveat -- this is NOT confirmed to fix the asymmetry, and might not
+
+Tested offline with a synthetic "good driving" episode (v_ego close to v_des most of the time,
+realistic jerk/heading/TTC noise): calibrated `beta` came out SMALLER than the current 0.5
+(~0.087 in that synthetic test), not larger. Smaller `beta` means `r_speed` becomes MORE
+sensitive to shortfall, not less -- the opposite of what would be needed to raise real
+`r_progress`'s low observed mean. This makes sense once framed correctly: the calibration
+philosophy behind `gamma_a`/`phi`/`tau` targets *expert-typical* behavior mapping to a MODERATE
+reward (~0.37-0.63), deliberately leaving headroom above that for even-better-than-expert
+behavior -- not a HIGH reward for expert-typical behavior. If real nuPlan expert data shows a
+similarly small typical shortfall fraction, a properly-calibrated `beta` could end up MORE
+punishing than the current uncalibrated 0.5, not less -- which would mean the low `r_progress`
+observed in real training partly reflects a genuine, meaningful gap between the RL policy's
+speed-tracking competence and expert-level competence, not a miscalibrated formula.
+
+This is genuinely unresolved without real data: the synthetic test used a made-up "good driving"
+distribution, not actual nuPlan expert rollouts. The fix is still worth having (methodological
+consistency, using real data instead of a guess, matching what the OTHER four parameters already
+do) regardless of which direction it moves `beta` -- but don't assume running it will "fix" the
+asymmetry until the actual calibrated value is known. The reward-component-spread diagnostic
+(`--log_reward_components` + `analyze_reward_spread.py`, built two entries back, still not run)
+remains the more direct way to answer the real question -- is the RL POLICY's own `r_speed`
+floor-saturated (low mean AND low std, little room to improve) vs. genuinely still-learning
+(low mean, healthy std, real room to improve) -- since it uses the policy's own real rollouts,
+not an expert baseline.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing (no test-suite code touched).
+- `python -c "import ast; ..."` syntax check.
+- Offline: `compute_reward_scaling()` run against synthetic episode dicts matching
+  `collect_expert_rollouts()`'s output structure -- produces a real, non-degenerate `beta` value
+  (~0.087 for the synthetic "good driving" case) instead of crashing or returning the old
+  hardcoded constant. Not verified against real nuPlan data -- needs the lab machine.
+
+### Outstanding
+
+- [ ] Re-run `make hyperparams-mini` (or the full-dataset equivalent) on the lab machine to get
+      the REAL calibrated `beta` from actual expert rollouts, then `make check-hyperparams` to
+      validate it lands in a sane range. This changes `hyperparams.json` -- existing runs used the
+      old hardcoded `beta=0.5` and aren't affected retroactively; only runs AFTER regenerating
+      `hyperparams.json` will use the new calibration.
+- [ ] Once the real calibrated value is known, re-interpret whether it raises or lowers typical
+      `r_progress` -- do not assume either direction in advance (see caveat above).
+- [ ] Run the reward-component-spread diagnostic (still outstanding from two entries back) --
+      answers the floor-saturation question directly, independent of whatever `beta` turns out to
+      calibrate to.
+- [ ] Everything else from prior entries' Outstanding sections still applies.
