@@ -1960,3 +1960,94 @@ not an expert baseline.
       answers the floor-saturation question directly, independent of whatever `beta` turns out to
       calibrate to.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-03 — Resuming the indicator-costs (CVaR) investigation; general checkpoint warm-start
+
+### Motivation
+
+Full-run reward-spread data (previous entry's follow-up) confirmed `jerk_lat` is exactly 0.0000
+(mean AND std) across a complete 5000-update run for both policies -- not a fluke. Investigating
+the cause surfaced something bigger than the originally-suspected angular_velocity propagation:
+`compute_hyperparams.py`'s `_safe_kinematics()` ROTATES `rear_axle_acceleration_2d` into the
+vehicle body frame using heading before treating `.x`/`.y` as longitudinal/lateral
+(`a_lon = a2d.x*cos_h + a2d.y*sin_h`, similarly for `a_lat`), while `PRISMRewardBuilder.build_reward()`
+in `prism/env/nuplan_env.py` reads `.x`/`.y` directly with no rotation at all. These two files
+disagree about whether `rear_axle_acceleration_2d` is already local/body-frame or global/map-frame
+-- a real inconsistency regardless of which is correct, and higher-stakes than the original
+hypothesis: if the global-frame theory is right, `j_lon` (which has looked healthy all session)
+hasn't been measuring true longitudinal jerk either. Added `scripts/check_accel_frame.py` -- a
+standalone diagnostic comparing raw `rear_axle_velocity_2d.x` against the unambiguous scalar
+`ego_state.dynamic_car_state.speed` -- to settle this empirically on the lab machine before
+committing to a fix in either direction. **The jerk fix itself is intentionally NOT implemented
+yet** -- guessing wrong here would be worse than the current silent gap.
+
+Given this, the user asked to move on to the indicator-costs (CVaR) experiment in parallel. This
+resumes the ORIGINAL instability-analysis investigation this whole branch is named for: a prior
+run (see the 2026-08-25 entry, `configs/prism_instability_experiment.yaml`) showed
+`cost_critic_loss` exploding into the tens of thousands and `var_nu` growing 30x without
+recovering, over an 8800-update baseline. That investigation was paused -- not resolved -- to
+isolate whether the instability traced to the cost side or the style-reward side; the entire
+DPMORL-only phase of this branch (every preceding entry) was that isolation test. This resumes
+the paused thread, now with a much-improved style-reward side and much better diagnostics.
+
+### Change 1: general, backend-agnostic checkpoint warm-start
+
+`scripts/train.py`: new `--warm_start_dir` flag and `run_stage2()` parameter, independent of the
+existing Alpamayo-specific `--backbone-phase b` mechanism (that one is for LoRA phase
+transitions specifically). Loads `<warm_start_dir>/policy_{k}/policy_{k}_model_final.pth` into
+each freshly-constructed agent before training, `strict=False`. Missing/unexpected keys are
+logged explicitly and loudly (not silently dropped) -- with `strict=False`, an architecture
+mismatch between the warm-start source and this run's config would otherwise silently skip
+layers rather than error, making the warm start partially or fully inert with no other symptom.
+Verified offline with a synthetic old/new agent pair (a new `cost_value_head` module absent from
+the "old" checkpoint) -- confirms the missing-key report is accurate and the shared layer loads
+correctly.
+
+### Change 2: `configs/prism_indicator_costs.yaml` + `make train-indicator-costs-mini-parallel`
+
+New config, same relationship to `prism_instability_experiment.yaml` that `prism_dpmorl_only.yaml`
+has to `prism_default.yaml`: scaled down to K=2 (matching this branch's fast-iteration
+convention) and 5000 updates (not 10000), mini dataset via the Makefile's `lab.env` paths. Keeps
+the SAME reduced-risk ablation toggles from the original, paused investigation (outcome costs
+off, indicator-only cost, TTC alone, fixed `alpha=0.5`) -- this is a resumption of that
+investigation, not a fresh maximally-scoped first test. `beta=1.0` is explicitly flagged as
+uncalibrated (same caveat `prism_default.yaml` already carried); `ent_coef=0.001` (with decay) is
+carried over from the DPMORL-only tuning, explicitly flagged as not re-tuned for this regime --
+`beta>0` introduces a second advantage stream (cost) into the same combined-advantage/entropy
+dynamic discussed at length in prior entries, which could shift the balance again.
+
+`make train-indicator-costs-mini-parallel` mirrors `train-dpmorl-only-mini-parallel`'s Stage-1-
+then-K-concurrent-processes pattern, with `WARM_START_DIR` and `LOG_REWARD_COMPONENTS` passthrough.
+`IC_OUT` is overridable (unlike `DPMORL_ONLY_OUT`) specifically so a from-scratch run and a
+warm-started run can write to different directories and be run side by side without colliding --
+`experiment_name` is fixed in the config (not CLI-overridable), so `IC_OUT` is the only thing that
+changes the final output path.
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing.
+- `python -c "import ast; ..."` syntax checks; `configs/prism_indicator_costs.yaml` parses and
+  reports the expected `n_policies=2`, `beta=1.0`, `active_indicators=['ttc']`,
+  `stage2.n_updates=5000`, `stage2.ent_coef=0.001`.
+- Offline: synthetic old/new agent state_dict round trip (see Change 1) confirms warm-start
+  loading and mismatch reporting work as intended.
+- `make -n train-indicator-costs-mini-parallel` dry run (both with and without
+  `WARM_START_DIR`/`LOG_REWARD_COMPONENTS`) confirms flags land correctly in both the
+  `--stage1_only` call and the per-policy parallel calls; with distinct `IC_OUT` values the two
+  variants' full output paths don't collide. `make -n train-dpmorl-only-mini-parallel` re-checked
+  unaffected (no regression).
+
+### Outstanding
+
+- [ ] Run `scripts/check_accel_frame.py` on the lab machine to settle the acceleration frame
+      convention before implementing the jerk fix.
+- [ ] Launch both indicator-costs variants:
+      `make train-indicator-costs-mini-parallel IC_OUT=runs/indicator_costs_scratch`
+      `make train-indicator-costs-mini-parallel IC_OUT=runs/indicator_costs_warmstart WARM_START_DIR=runs/dpmorl_only/prism_dpmorl_only_001`
+      Watch `reward_loss`/`cost_penalty` early (per `beta`'s own uncalibrated-value caveat), and
+      whether `cost_critic_loss`/`var_nu` show the same explosive pattern as the original 8800-
+      update baseline -- that's the specific thing this config exists to re-check, now with much
+      better tooling.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

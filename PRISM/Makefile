@@ -34,7 +34,7 @@ PYTHON            := python
 
 .PHONY: all setup check-env check cache cache-mini hyperparams hyperparams-mini \
         check-hyperparams train train-mini train-instability-mini train-dpmorl-only-mini \
-        train-dpmorl-only-mini-parallel test clean help
+        train-dpmorl-only-mini-parallel train-indicator-costs-mini-parallel test clean help
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Default target
@@ -56,6 +56,7 @@ help:
 	@echo "  make train-instability-mini  Instability-analysis experiment (mini dataset)"
 	@echo "  make train-dpmorl-only-mini  DPMORL-only experiment, safety off (mini dataset)"
 	@echo "  make train-dpmorl-only-mini-parallel  Same, K policies as concurrent processes"
+	@echo "  make train-indicator-costs-mini-parallel  Indicator-costs (CVaR) experiment, K concurrent processes"
 	@echo "  make cache              Build cache from full train dataset"
 	@echo "  make hyperparams        Compute hyperparams (full, 200 rollouts)"
 	@echo "  make train              Full PRISM training run"
@@ -268,6 +269,60 @@ train-dpmorl-only-mini-parallel:
 	done; \
 	wait; \
 	echo "── All $(N_POLICIES) polic$(if $(filter 1,$(N_POLICIES)),y,ies) finished. Metrics in $(DPMORL_ONLY_OUT)/$(DPMORL_ONLY_EXP)/policy_*/  ──"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Indicator-costs experiment (resumes the paused cost/CVaR-side instability
+# investigation -- see CHANGES.md and configs/prism_indicator_costs.yaml's
+# header comment). Same Stage-1-then-K-concurrent-processes pattern as
+# train-dpmorl-only-mini-parallel above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+IC_N_POLICIES ?= $(shell $(PYTHON) -c "import yaml; print(yaml.safe_load(open('configs/prism_indicator_costs.yaml'))['n_policies'])")
+# Overridable so a from-scratch run and a warm-started run don't collide --
+# both would otherwise write to the same runs/indicator_costs/
+# prism_indicator_costs_001/ (experiment_name is fixed in the config, not
+# CLI-overridable, so IC_OUT is the only knob that changes the final path).
+# e.g.:
+#   make train-indicator-costs-mini-parallel IC_OUT=runs/indicator_costs_scratch
+#   make train-indicator-costs-mini-parallel IC_OUT=runs/indicator_costs_warmstart WARM_START_DIR=runs/dpmorl_only/prism_dpmorl_only_001
+IC_OUT ?= runs/indicator_costs
+IC_EXP := prism_indicator_costs_001
+
+# Optional warm-start passthrough, e.g.:
+#   make train-indicator-costs-mini-parallel WARM_START_DIR=runs/dpmorl_only/prism_dpmorl_only_001
+# WARM_START_DIR must point at the EXPERIMENT directory (containing
+# policy_0/, policy_1/, ... directly), not the general output dir --
+# matches whatever --output_dir/experiment_name a prior run used.
+# LOG_REWARD_COMPONENTS is the same variable train-dpmorl-only-mini-parallel
+# uses above (global, not redefined here).
+WARM_START_DIR ?=
+IC_FLAGS := $(if $(WARM_START_DIR),--warm_start_dir $(WARM_START_DIR)) $(if $(LOG_REWARD_COMPONENTS),--log_reward_components)
+
+train-indicator-costs-mini-parallel:
+	@echo "── Indicator-costs experiment: Stage 1, then $(IC_N_POLICIES) polic$(if $(filter 1,$(IC_N_POLICIES)),y,ies) as concurrent processes $(if $(WARM_START_DIR),(warm-started from $(WARM_START_DIR)),(from scratch)) ──"
+	$(PYTHON) scripts/train.py \
+	    --config     configs/prism_indicator_costs.yaml \
+	    --hyperparams hyperparams.json \
+	    --nuplan_data_root $(NUPLAN_MINI_ROOT) \
+	    --cache_path  $(MINI_CACHE_PATH) \
+	    --output_dir  $(IC_OUT) \
+	    $(if $(LOG_REWARD_COMPONENTS),--log_reward_components) \
+	    --stage1_only
+	@echo "── Stage 1 done. Launching policy_ids 0..$$(($(IC_N_POLICIES)-1)) concurrently -- logs in $(IC_OUT)/policy_*.log ──"
+	@for k in $$(seq 0 $$(($(IC_N_POLICIES)-1))); do \
+	    $(PYTHON) scripts/train.py \
+	        --config     configs/prism_indicator_costs.yaml \
+	        --hyperparams hyperparams.json \
+	        --nuplan_data_root $(NUPLAN_MINI_ROOT) \
+	        --cache_path  $(MINI_CACHE_PATH) \
+	        --output_dir  $(IC_OUT) \
+	        --skip_stage1 \
+	        --utility_fn_dir $(IC_OUT)/$(IC_EXP)/stage1 \
+	        $(IC_FLAGS) \
+	        --policy_ids $$k > $(IC_OUT)/policy_$$k.log 2>&1 & \
+	done; \
+	wait; \
+	echo "── All $(IC_N_POLICIES) polic$(if $(filter 1,$(IC_N_POLICIES)),y,ies) finished. Metrics in $(IC_OUT)/$(IC_EXP)/policy_*/  ──"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training — full run

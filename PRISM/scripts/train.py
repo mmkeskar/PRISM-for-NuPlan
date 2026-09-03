@@ -475,6 +475,7 @@ def run_stage2(
     backbone_phase: str = "a",
     phase_a_dir: Path = None,
     policy_ids: list = None,
+    warm_start_dir: Path = None,
 ) -> None:
     """
     Train K policies with their respective utility functions.
@@ -484,6 +485,10 @@ def run_stage2(
     error) -- lets multiple concurrent OS processes each own a disjoint
     subset for real wall-clock parallelism. None (default) trains all,
     sequentially, exactly as before.
+
+    warm_start_dir: general, backend-agnostic checkpoint warm-start (see
+    --warm_start_dir's help text) -- distinct from the Alpamayo-specific
+    Phase A/B mechanism below.
     """
     n_policies = len(utility_fns)
     stage2_cfg = cfg.get("stage2", {})
@@ -532,6 +537,41 @@ def run_stage2(
                 logger.warning(
                     f"[Phase B] Phase A checkpoint not found at {ckpt} — "
                     "starting Phase B from scratch for policy {k}"
+                )
+
+        # General warm-start: load a previous run's saved policy weights
+        # (e.g. a DPMORL-only run, trained with beta=0) as this policy's
+        # starting point. Independent of backbone_phase -- this is NOT the
+        # Alpamayo Phase A/B mechanism above (that one is specific to LoRA
+        # phase transitions); this is a general "start from a previously-
+        # trained checkpoint" path usable for any backend/experiment. See
+        # --warm_start_dir's help text and CHANGES.md.
+        if warm_start_dir is not None:
+            ckpt = Path(warm_start_dir) / f"policy_{k}" / f"policy_{k}_model_final.pth"
+            if ckpt.exists():
+                missing, unexpected = agent.load_state_dict(
+                    torch.load(ckpt, map_location=device), strict=False
+                )
+                logger.info(f"[Warm start] Loaded checkpoint for policy {k}: {ckpt}")
+                if missing or unexpected:
+                    # Loud, not a debug-level note: strict=False means a
+                    # genuine architecture mismatch between the warm-start
+                    # source and this run's config would silently skip
+                    # layers rather than error, making the warm start
+                    # partially or fully inert with no other symptom.
+                    logger.warning(
+                        f"[Warm start] Policy {k}: state_dict mismatch -- "
+                        f"missing={missing}  unexpected={unexpected}. If "
+                        f"this is more than a handful of expected new keys "
+                        f"(e.g. a newly-added module), the source and "
+                        f"target configs' architectures likely don't match "
+                        f"and the warm start may not be doing what you "
+                        f"expect."
+                    )
+            else:
+                logger.warning(
+                    f"[Warm start] Checkpoint not found at {ckpt} — "
+                    f"starting policy {k} from scratch instead."
                 )
 
         optimizer = torch.optim.Adam(
@@ -604,6 +644,27 @@ def parse_args():
                         help="Load pre-saved utility functions and go straight to Stage 2")
     parser.add_argument("--utility_fn_dir", type=str, default=None,
                         help="Directory containing saved utility function checkpoints")
+    parser.add_argument(
+        "--warm_start_dir", type=str, default=None,
+        help=(
+            "Directory of a PREVIOUS run's output (e.g. a DPMORL-only run) to "
+            "load each policy's agent weights from before Stage 2 training, "
+            "instead of the from-scratch random init CLAUDE.md's Design "
+            "Decision #1 otherwise specifies. Expects "
+            "<warm_start_dir>/policy_{k}/policy_{k}_model_final.pth per "
+            "policy k (the same layout run_stage2() already writes). "
+            "Independent of "
+            "--backbone-phase b (that mechanism is Alpamayo-specific, for "
+            "LoRA phase transitions; this is a general, backend-agnostic "
+            "warm-start path). Loaded with strict=False -- if the source and "
+            "target configs' architecture hyperparameters don't match "
+            "exactly, mismatched layers are silently skipped rather than "
+            "erroring, which would make the warm start partially or fully "
+            "inert without any error. Missing/unexpected keys are logged "
+            "explicitly for this reason -- check that log line, don't just "
+            "assume it worked. See CHANGES.md."
+        ),
+    )
     parser.add_argument(
         "--policy_ids", type=str, default=None,
         help=(
@@ -847,6 +908,7 @@ def main():
         backbone_phase=backbone_phase or "a",
         phase_a_dir=phase_a_dir,
         policy_ids=policy_ids,
+        warm_start_dir=Path(args.warm_start_dir) if args.warm_start_dir else None,
     )
 
     logger.info(f"\nTraining complete.  Results in: {output_dir}")
