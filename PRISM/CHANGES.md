@@ -2324,3 +2324,89 @@ since `r_lane` is gone), and the "three different betas" convention note updated
       distribution shape) are explicitly Step 2 of the user's own staged validation sequence
       (cost-side, still `beta=0`) -- not started, not in scope for this entry.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-04 (cont.) — `phi` calibration bug: unwrapped heading fed into savgol_filter/gradient in compute_hyperparams.py
+
+### How this surfaced
+
+Ran `make hyperparams-mini` + `make check-hyperparams` on the lab machine to regenerate
+`hyperparams.json` under the new per-regime `beta` schema (see the entry above). All three
+per-regime `beta` values passed their range check (`free_flow=0.4615`, `car_following=0.0656`,
+`congested=0.4273` -- confirming that calibration works and the spread is sensible). But `phi`
+(heading-error scaling for `r_heading`) came back `0.4107 rad/s` against an expected
+`[0.01, 0.3]` range -- a genuine FAIL, not a WARN.
+
+### Root cause: confirmed, not just suspected
+
+`phi` directly affects training -- it is read live every step via `compute_style_rewards()`'s
+`scaling["phi"]`, shaping `r_heading = exp(-(|delta_psi|/phi)^2)`, one of the two factors in
+`r_lateral`, one of the 4 style reward dimensions actually optimised. So an inflated `phi` isn't a
+diagnostic-only concern -- it directly overstates how much heading error `r_heading` should
+tolerate before penalising it, and understating the calibration silently degrades PRISM's own
+lateral-discipline reward.
+
+`compute_hyperparams.py`'s `_extract_episode()` computes `phi = std(|delta_psi|)` pooled across all
+200 expert rollouts. `delta_psi` (when the mini dataset's `angular_velocity=0.0` gap forces the
+finite-difference fallback -- the common case, per CLAUDE.md's documented caveat) comes from
+`np.gradient(savgol_filter(head_arr), _DT)`, where `head_arr = [s.center.heading for s in
+ego_states]` -- **fed in raw, without `np.unwrap()` first.** Ego heading wraps at +-pi (nuPlan
+convention); any scenario where heading crosses that boundary (U-turns, some roundabout
+manoeuvres -- more common in the mini dataset's Singapore scenes than a "typical road" assumption
+would suggest) produces a raw ~2*pi discontinuity in `head_arr` that `savgol_filter`/`np.gradient`
+then turn into a large spurious spike in `delta_psi` right at the wrap point.
+
+This exact bug pattern was already found and fixed once before, in `nuplan_env.py`'s
+`_causal_yaw_rate()` (live training path, see the 2026-09-03 (cont.) entry above) -- but that fix
+was never ported to this second, independent heading-differentiation call site in
+`compute_hyperparams.py`'s calibration path. The two pipelines compute the same underlying
+quantity (yaw rate from smoothed heading) but never shared code, so the fix silently missed one of
+its two call sites.
+
+**Confirmed numerically**, not just by inspection -- synthetic heading trace, constant true yaw
+rate 0.2 rad/s, ramping through the +-pi wraparound, run through the exact `_wl`/`savgol_filter`/
+`np.gradient` pipeline `_extract_episode()` uses:
+
+```
+wrapped heading (crosses +-pi): [3.0 ... 3.14  -3.123 ... -2.903]
+BUGGY  delta_psi (no unwrap): max=19.248  mean=3.820   (vs. true rate 0.20)
+FIXED  delta_psi (unwrapped): max=0.200   mean=0.200   (exact match)
+```
+
+A single scenario crossing the wrap wraparound injects values up to ~19 rad/s into the pooled
+`all_delta_psi` array that `phi = std(...)` is computed from -- easily enough to explain an
+observed `phi=0.41` against an expected `0.01-0.3` from real, non-buggy heading-rate variance.
+
+### Fix
+
+`compute_hyperparams.py`: `head_arr = np.unwrap(np.array([s.center.heading for s in
+ego_states]))` -- unwrapped once, immediately at construction, so both the `savgol_filter` branch
+and the except-fallback branch downstream automatically use the corrected signal (no other code
+changes needed; `head_arr` had exactly two consumers, both fixed by fixing the one definition).
+Same fix pattern as `_causal_yaw_rate()`'s `np.unwrap()` call, applied to the second, previously-
+missed call site.
+
+### Verification
+
+- Synthetic wraparound test above (offline, no nuPlan dependency) -- confirms the fix recovers the
+  exact true yaw rate where the buggy version produced a ~96x inflated spike.
+- `python -m pytest tests/` -- 59/59 passing (this path isn't covered by the reward unit tests,
+  which don't exercise `compute_hyperparams.py`'s nuPlan-dependent extraction code; the synthetic
+  test above is the actual verification for this fix).
+- Syntax check (`ast.parse`) on the modified file.
+
+### Outstanding
+
+- [ ] Delete `hyperparams.json` and rerun `make hyperparams-mini` + `make check-hyperparams` on the
+      lab machine -- this is now a SECOND, independent reason to regenerate it (on top of the
+      per-regime `beta` schema change above). Confirm `phi` now falls within `[0.01, 0.3]`
+      post-fix; if it's still out of range, that would indicate the "typical road" assumption
+      behind the range itself is wrong for this dataset (not a code bug), and the range in
+      `scripts/check_hyperparams.py` should be widened instead.
+- [ ] Consider whether `_extract_episode()`'s savgol/gradient pipeline and `nuplan_env.py`'s
+      `_causal_yaw_rate()`/`_causal_jerk()` should share one implementation instead of two parallel
+      ones -- this bug existed specifically because a fix to one didn't propagate to the other.
+      Not done as part of this fix (would require reworking the causal/online vs. batch/offline
+      shape mismatch between the two call sites); flagged for a future cleanup pass.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

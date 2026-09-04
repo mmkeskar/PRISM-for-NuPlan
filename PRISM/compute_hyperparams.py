@@ -137,7 +137,15 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
     ego_states = [scenario.get_ego_state_at_iteration(i) for i in range(n_iter)]
 
     # ── 2. Kinematic arrays ───────────────────────────────────────────────────
-    head_arr = np.array([s.center.heading for s in ego_states])
+    # np.unwrap() immediately -- heading wraps at +-pi (nuPlan convention), and
+    # feeding a raw, wrapped signal into savgol_filter/np.gradient below would
+    # produce a spurious ~2*pi/dt jump at any wrap crossing (u-turns, some
+    # roundabout manoeuvres -- more common in the mini dataset's Singapore
+    # scenes than the "typical road" assumption behind check_hyperparams.py's
+    # phi range). This mirrors the fix already applied to nuplan_env.py's
+    # _causal_yaw_rate() (see CHANGES.md) -- this call site never got it and
+    # was silently inflating delta_psi/phi ever since. See CHANGES.md.
+    head_arr = np.unwrap(np.array([s.center.heading for s in ego_states]))
 
     # Extract velocity, acceleration, and angular velocity from the EgoState's
     # built-in IMU-derived fields.  Finite-differencing position three times to
