@@ -36,6 +36,11 @@ class RegimeResult:
     has_lead: bool     # whether a lead vehicle was detected
     v_lane_avg: float  # average speed of nearby vehicles [m/s]
     v_limit: float     # speed limit of current lane [m/s]
+    n_surrounding_agents: int = 0  # vehicles used for v_lane_avg / the
+                                    # free-flow percentile target -- exposed
+                                    # so callers can log how often the
+                                    # percentile estimate is running on a
+                                    # thin sample (see CHANGES.md)
 
 
 class RegimeDetector:
@@ -50,6 +55,20 @@ class RegimeDetector:
         Longitudinal look-ahead and look-behind distance for lane traffic [m].
     lead_lateral_tolerance_m : float
         Maximum lateral offset for an object to count as in the ego lane [m].
+    flow_percentile : float
+        Free-flow v_des tracks this percentile of surrounding-traffic speed
+        (not the posted limit alone) -- progress captures swiftness/
+        efficiency of travel, not "match the median" (a comfort-style
+        target). 80th percentile: keep pace with the faster portion of
+        traffic, not just the typical car. Reasoned starting point, not
+        precisely tuned -- see CHANGES.md.
+    min_agents_for_percentile : int
+        Minimum surrounding-vehicle count before trusting the percentile
+        estimate; below this, falls back to v_limit (same fallback the
+        zero-agent case already used). A percentile over 2-3 vehicles is
+        essentially "the fastest one" -- too noisy/outlier-sensitive to
+        use as a moving target. Reasoned starting point, not precisely
+        tuned.
     """
 
     DEFAULT_SPEED_LIMIT_MPS: float = 13.89  # 50 km/h fallback
@@ -59,10 +78,14 @@ class RegimeDetector:
         congestion_speed_fraction: float = 0.5,
         observation_horizon_m: float = 50.0,
         lead_lateral_tolerance_m: float = 2.5,
+        flow_percentile: float = 80.0,
+        min_agents_for_percentile: int = 4,
     ) -> None:
         self._cong_frac = congestion_speed_fraction
         self._horizon = observation_horizon_m
         self._lat_tol = lead_lateral_tolerance_m
+        self._flow_percentile = flow_percentile
+        self._min_agents = min_agents_for_percentile
 
     def detect(
         self,
@@ -74,7 +97,9 @@ class RegimeDetector:
         v_limit = self._get_speed_limit(ego_state, map_cache)
 
         v_lead, d_lead, has_lead = self._find_lead(ego_state, detection_cache)
-        v_lane_avg = self._lane_avg_speed(ego_state, detection_cache)
+        surrounding_speeds = self._surrounding_speeds(ego_state, detection_cache)
+        n_surrounding = len(surrounding_speeds)
+        v_lane_avg = float(np.mean(surrounding_speeds)) if surrounding_speeds else self.DEFAULT_SPEED_LIMIT_MPS
 
         # 1. Congested?
         if v_lane_avg < self._cong_frac * v_limit:
@@ -86,6 +111,7 @@ class RegimeDetector:
                 has_lead=has_lead,
                 v_lane_avg=v_lane_avg,
                 v_limit=v_limit,
+                n_surrounding_agents=n_surrounding,
             )
 
         # 2. Car-following?
@@ -98,17 +124,30 @@ class RegimeDetector:
                 has_lead=has_lead,
                 v_lane_avg=v_lane_avg,
                 v_limit=v_limit,
+                n_surrounding_agents=n_surrounding,
             )
 
-        # 3. Free-flow
+        # 3. Free-flow -- traffic-aware: track the fast portion of
+        # surrounding traffic, not just the posted limit, since progress
+        # is about swiftness/efficiency of travel, not "match the median"
+        # (a comfort-style target already captured elsewhere). Falls back
+        # to v_limit when too few vehicles are nearby to trust a
+        # percentile estimate. max() with v_limit means this never pulls
+        # v_des BELOW the posted limit, only ever raises it. See CHANGES.md.
+        if n_surrounding >= self._min_agents:
+            v_flow = float(np.percentile(surrounding_speeds, self._flow_percentile))
+            v_des_free_flow = max(v_limit, v_flow)
+        else:
+            v_des_free_flow = v_limit
         return RegimeResult(
             regime=Regime.FREE_FLOW,
-            v_des=v_limit,
+            v_des=v_des_free_flow,
             v_lead=v_lead,
             d_lead=d_lead,
             has_lead=has_lead,
             v_lane_avg=v_lane_avg,
             v_limit=v_limit,
+            n_surrounding_agents=n_surrounding,
         )
 
     # ------------------------------------------------------------------
@@ -177,8 +216,14 @@ class RegimeDetector:
 
         return v_lead, best_d, has_lead
 
-    def _lane_avg_speed(self, ego_state, detection_cache) -> float:
-        """Average speed of vehicles within ±horizon ahead/behind in ego frame."""
+    def _surrounding_speeds(self, ego_state, detection_cache) -> list:
+        """
+        Raw speeds of vehicles within +-horizon ahead/behind in ego frame,
+        same lateral tolerance as the lead-vehicle check -- i.e. same
+        direction of travel, in-lane-ish. Shared by v_lane_avg (mean, used
+        for congestion detection) and the free-flow percentile target
+        (detect()) so both read from one scan of tracked_objects, not two.
+        """
         cos_h, sin_h = self._ego_basis(ego_state)
         ex, ey = ego_state.center.x, ego_state.center.y
 
@@ -197,11 +242,7 @@ class RegimeDetector:
                         pass
         except Exception:
             pass
-
-        if speeds:
-            return float(np.mean(speeds))
-        # No surrounding vehicles; treat as free-flow
-        return self.DEFAULT_SPEED_LIMIT_MPS
+        return speeds
 
     @staticmethod
     def _ego_basis(ego_state) -> Tuple[float, float]:

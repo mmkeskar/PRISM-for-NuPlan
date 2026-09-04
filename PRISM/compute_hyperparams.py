@@ -21,8 +21,9 @@ Cached values
 -------------
 Reward scaling:
     sigma_j_sq   : empirical variance of (j_lon^2 + j_lat^2) -- comfort
-    beta         : speed shortfall scaling for progress
-    gamma_a      : acceleration scaling for progress
+    beta         : speed shortfall scaling for progress, PER REGIME
+                   ({"free_flow": ..., "car_following": ..., "congested": ...}
+                   -- see compute_reward_scaling())
     phi          : heading error scaling for lateral discipline
     tau          : TTC scaling for spacing
 
@@ -194,6 +195,14 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
     d_lead_arr = np.full(n_iter, np.inf)
     v_lead_arr = np.zeros(n_iter)
     has_lead_arr = np.zeros(n_iter, dtype=bool)
+    # Per-timestep regime label ("free_flow" / "car_following" / "congested"),
+    # captured so compute_reward_scaling() can calibrate beta separately per
+    # regime instead of pooling across all three (see CHANGES.md) -- free-flow's
+    # now-traffic-aware v_des target has a meaningfully different typical
+    # shortfall than car-following's naturally-easy v_lead-tracking, and
+    # pooling would let the easier regimes mask a persistently-low-gradient
+    # free-flow case.
+    regime_arr = np.full(n_iter, "free_flow", dtype=object)
 
     map_proxy = _EmptyMapProxy()
 
@@ -206,6 +215,7 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
             d_lead_arr[i]  = result.d_lead
             v_lead_arr[i]  = result.v_lead
             has_lead_arr[i] = result.has_lead
+            regime_arr[i]  = result.regime.name.lower()
         except Exception:
             pass
 
@@ -226,8 +236,7 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
                 j_lat=float(j_lat[i]),
                 v_ego=float(v_ego[i]),
                 v_des=float(v_des_arr[i]),
-                lane_index=1,
-                n_lanes=2,
+                beta=bootstrap_hp["reward_scaling"]["beta"],
                 d_lat=float(d_lat[i]),
                 delta_psi=float(delta_psi[i]),
                 d_lead=float(d_lead_arr[i]) if np.isfinite(d_lead_arr[i]) else 100.0,
@@ -281,6 +290,7 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
         "j_lat":             j_lat,
         "v_ego":             v_ego,
         "v_des":             v_des_arr,
+        "regime":            regime_arr,
         "a_ego":             a_lon,
         "d_lat":             d_lat,
         "delta_psi":         delta_psi,
@@ -408,7 +418,6 @@ def collect_expert_rollouts(n_rollouts: int,
         "reward_scaling": {
             "sigma_j_sq": 1.0,
             "beta":       0.5,
-            "gamma_a":    1.0,
             "phi":        0.3,
             "tau":        3.0,
             "sigma_d":    0.2,
@@ -487,28 +496,41 @@ def collect_expert_rollouts(n_rollouts: int,
     return episodes
 
 
+_REGIMES = ("free_flow", "car_following", "congested")
+_MIN_SAMPLES_PER_REGIME = 500  # below this, a regime's beta falls back to the
+                                # pooled value (see compute_reward_scaling) --
+                                # not precisely tuned, just enough samples that
+                                # a per-regime mean isn't dominated by a
+                                # handful of episodes' idiosyncrasies.
+
+
 def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     """
     Compute scaling parameters for all four reward functions.
 
     sigma_j_sq : Var(j_lon^2 + j_lat^2)
-    beta       : set so mean shortfall fraction (under EXPERT driving) ->
-                 reward = e^{-1}, i.e. beta = mean((v_des-v_ego)+ / v_des).
-                 Previously a hand-picked constant (0.5, "so a 50% shortfall
-                 -> e^{-1}") -- the ONE reward-scaling parameter here that
-                 wasn't calibrated from real data, unlike every other one
-                 below. Root-caused via the instability-analysis branch
-                 (see CHANGES.md): real DPMORL-only runs show z_progress
-                 sitting far lower, relative to its own achievable ceiling,
-                 than z_comfort/z_lateral/z_spacing -- an uncalibrated beta
-                 was a live candidate explanation, since a policy could be
-                 driving at genuinely expert-comparable competence yet still
-                 get systematically low r_speed if 0.5 doesn't match what
-                 real (expert) driving's typical shortfall actually looks
-                 like. This calibrates it the same way as gamma_a/phi/tau
-                 below, rather than resolving the question by guesswork.
-    gamma_a    : set so mean |a_ego| -> reward = 1 - e^{-1} ~ 0.63
-                 i.e. gamma_a = mean(|a_ego|)
+    beta       : PER-REGIME dict {"free_flow": ..., "car_following": ...,
+                 "congested": ...}, each set so that regime's mean shortfall
+                 fraction (under EXPERT driving) -> reward = e^{-1}, i.e.
+                 beta_r = mean((v_des-v_ego)+ / v_des | regime==r).
+
+                 Calibrated separately per regime (not pooled) because the
+                 three regimes' v_des targets have structurally different
+                 character: free-flow's v_des is now traffic-aware
+                 (max(v_limit, 80th-percentile of surrounding speed) -- see
+                 regime_detector.py), which is a harder target than
+                 car-following's v_lead (naturally easy to track, since
+                 tracking a lead vehicle is close to r_progress's own
+                 objective) or congested's v_lane_avg. Pooling all three into
+                 one beta would let the easier regimes' small shortfalls
+                 dominate the mean, silently flattening free-flow's gradient
+                 even though that's exactly the regime doing the most
+                 "swiftness/efficiency" work in the reward. See CHANGES.md.
+
+                 A regime with fewer than _MIN_SAMPLES_PER_REGIME timesteps
+                 across all episodes falls back to the pooled (all-regime)
+                 beta, with a printed warning -- calibrating from a thin
+                 sample would just encode noise as a per-regime "signal".
     phi        : set so 1-sigma |delta_psi| -> reward = e^{-1}
                  i.e. phi = std(|delta_psi|)
     tau        : set so mean(TTC) when TTC < 10s -> reward ~0.63
@@ -516,7 +538,6 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     """
     all_jerk_sq   = np.concatenate([ep["j_lon"]**2 + ep["j_lat"]**2
                                      for ep in episodes])
-    all_a_ego     = np.concatenate([np.abs(ep["a_ego"]) for ep in episodes])
     all_delta_psi = np.concatenate([np.abs(ep["delta_psi"]) for ep in episodes])
     all_ttc       = np.concatenate([ep["ttc"][ep["ttc"] < 10]
                                      for ep in episodes])
@@ -531,13 +552,13 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
         np.maximum(0.0, ep["v_des"] - ep["v_ego"]) / np.maximum(ep["v_des"], 0.5)
         for ep in episodes
     ])
+    all_regime = np.concatenate([
+        np.asarray(ep["regime"], dtype=object) for ep in episodes
+    ])
 
     sigma_j_sq = float(np.var(all_jerk_sq))
     # Avoid division by zero
     sigma_j_sq = max(sigma_j_sq, 1e-6)
-
-    gamma_a = float(np.mean(all_a_ego))
-    gamma_a = max(gamma_a, 1e-6)
 
     phi = float(np.std(all_delta_psi))
     phi = max(phi, 1e-4)
@@ -545,14 +566,26 @@ def compute_reward_scaling(episodes: List[Dict]) -> Dict:
     tau = float(np.mean(all_ttc)) if len(all_ttc) > 0 else 2.0
     tau = max(tau, 0.1)
 
-    beta = float(np.mean(all_shortfall_frac))
-    beta = max(beta, 1e-3)
+    beta_pooled = float(np.mean(all_shortfall_frac))
+    beta_pooled = max(beta_pooled, 1e-3)
+
+    beta: Dict[str, float] = {}
+    for regime in _REGIMES:
+        mask = all_regime == regime
+        n = int(mask.sum())
+        if n >= _MIN_SAMPLES_PER_REGIME:
+            beta[regime] = max(float(np.mean(all_shortfall_frac[mask])), 1e-3)
+        else:
+            print(f"  [compute_reward_scaling] WARNING: only {n} samples for "
+                  f"regime '{regime}' (< {_MIN_SAMPLES_PER_REGIME}) -- "
+                  f"falling back to pooled beta={beta_pooled:.4f}")
+            beta[regime] = beta_pooled
+
     sigma_d = 0.2  # tolerance width for lateral deviation following lane keeping data W. Zhang et al., “Empirical performance evaluation of lane keeping assistance systems,” arXiv preprint arXiv:2505.11534, 2025.
 
     return {
         "sigma_j_sq": sigma_j_sq,
         "beta":       beta,
-        "gamma_a":    gamma_a,
         "phi":        phi,
         "tau":        tau,
         "sigma_d":    sigma_d,
@@ -728,6 +761,13 @@ def main():
         "regime_detection": {
             "congestion_speed_fraction": 0.5,
             "observation_horizon_m":     50.0,
+            # Free-flow v_des tracks this percentile of surrounding-traffic
+            # speed rather than the posted limit alone (progress is about
+            # swiftness/efficiency, not "match the median"); reasoned
+            # starting points, not calibrated from data -- see
+            # RegimeDetector's own docstring and CHANGES.md.
+            "flow_percentile":            80.0,
+            "min_agents_for_percentile":  4,
         },
         "floor_values": {
             "delta_d": 0.3,
@@ -748,8 +788,8 @@ def main():
     print(f"[compute_hyperparams] Saved to {output_path}")
     print("\nComputed values:")
     print(f"  sigma_j_sq : {scaling['sigma_j_sq']:.6f}")
-    print(f"  beta       : {scaling['beta']:.4f}")
-    print(f"  gamma_a    : {scaling['gamma_a']:.4f}")
+    print(f"  beta       : " + ", ".join(
+        f"{regime}={scaling['beta'][regime]:.4f}" for regime in _REGIMES))
     print(f"  phi        : {scaling['phi']:.4f}")
     print(f"  tau        : {scaling['tau']:.4f}")
     print(f"  indicator weights: {ind_params['indicator_weights']}")

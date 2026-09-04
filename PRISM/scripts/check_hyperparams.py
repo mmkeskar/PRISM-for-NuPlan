@@ -50,15 +50,18 @@ def check_range(label, val, lo, hi, unit="", warn_only=False):
       sigma_j_sq  0.1–50  (m/s³)²   — comfort reward calibrated so jerk=sqrt(σ²) gives r≈0.37;
                                         RMS jerk in comfortable driving is 0.5–2 m/s³ → σ²≈2–30;
                                         upper 50 is generous for edge cases.
-      gamma_a     0.3–3.0  m/s²      — r_accel=0.63 when |a|=γ_a; empirical mean |a| in urban
-                                        driving is 0.5–2 m/s²; warn (not fail) if low since
-                                        smooth mini scenarios can be legitimately near 0.2 m/s².
       phi         0.01–0.3  rad/s    — r_heading calibrated so |Δψ|=φ gives r≈0.37; std of
                                         heading rate is ~0.02–0.10 rad/s on typical roads
                                         (straight: ~0, lane change: ~0.05, gentle turn: ~0.1).
       tau         1.0–6.0  s         — mean TTC when a lead vehicle is present and closing;
                                         safe following ≈ 2–4 s, aggressive ≈ 1–2 s, relaxed ≈ 5 s.
-      beta        0.4–0.6            — fixed at 0.5 by design (speed shortfall scaling).
+      beta        0.01–0.6           — mean expert shortfall fraction, calibrated PER REGIME
+                                        (free_flow / car_following / congested -- see
+                                        compute_hyperparams.py's compute_reward_scaling). No
+                                        longer fixed at 0.5 by design; warn-only since the
+                                        plausible range genuinely differs by regime (e.g.
+                                        car-following tracks v_lead closely -> small shortfall,
+                                        while free-flow's traffic-aware v_des is a harder target).
       sigma_d     0.15–0.25  m       — fixed at 0.2 m by design (lateral deviation tolerance).
     """
     range_str = f"[{lo} – {hi}]{(' ' + unit) if unit else ''}"
@@ -93,10 +96,18 @@ def main(hp_path: str):
     section("Reward scaling")
     sc = hp.get("reward_scaling", {})
     check_range("sigma_j_sq", sc.get("sigma_j_sq", -1),  0.1,  50.0, "(m/s³)²")
-    check_range("gamma_a",    sc.get("gamma_a",    -1),  0.3,   3.0, "m/s²",   warn_only=True)
     check_range("phi",        sc.get("phi",        -1),  0.01,  0.3, "rad/s")
     check_range("tau",        sc.get("tau",        -1),  1.0,   6.0, "s")
-    check_range("beta",       sc.get("beta",       -1),  0.4,   0.6)
+
+    beta = sc.get("beta", {})
+    if not isinstance(beta, dict):
+        fail_(f"beta               got {beta!r}  expect a per-regime dict "
+              "(free_flow/car_following/congested) -- stale hyperparams.json?")
+    else:
+        for regime in ["free_flow", "car_following", "congested"]:
+            check_range(f"beta[{regime}]", beta.get(regime, -1), 0.01, 0.6,
+                        warn_only=True)
+
     check_range("sigma_d",    sc.get("sigma_d",    -1),  0.15,  0.25, "m")
 
     # ── z_t normalisation ─────────────────────────────────────────────────────

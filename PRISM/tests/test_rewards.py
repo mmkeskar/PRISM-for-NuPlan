@@ -42,7 +42,6 @@ def default_hp():
         "reward_scaling": {
             "sigma_j_sq": 1.0,
             "beta": 0.5,
-            "gamma_a": 1.0,
             "phi": 0.3,
             "tau": 2.0,
             "sigma_d": 0.2,
@@ -99,40 +98,35 @@ class TestProgress:
     def test_output_in_zero_one_interval(self):
         for v_ego in [0, 5, 10, 15]:
             for v_des in [5, 10, 15]:
-                r = compute_progress(
-                    v_ego=v_ego, v_des=v_des,
-                    lane_index=0, n_lanes=1,
-                    beta=0.5,
-                )
+                r = compute_progress(v_ego=v_ego, v_des=v_des, beta=0.5)
                 assert 0.0 < r <= 1.0, (
                     f"Out of (0,1] for v_ego={v_ego}, v_des={v_des}"
                 )
 
-    def test_single_lane_neutral_r_lane(self):
-        # Single lane: r_lane = 0.5
-        r1 = compute_progress(10, 10, lane_index=0, n_lanes=1, beta=0.5)
-        # Two lanes: r_lane = lane_index / (n_lanes - 1). lane_index=0 is the
-        # RIGHTMOST (slowest) lane, lane_index=n_lanes-1 is the LEFTMOST
-        # (fastest) lane -- matches _lane_position()'s sort order
-        # (nuplan_env.py) and the paper (docs/prism_paper_v2.tex, eq.
-        # progress: "leftmost (fastest) lane scores 1, rightmost scores 0").
-        # So lane_index=0 must score LOWEST, not highest.
-        r2_right = compute_progress(10, 10, lane_index=0, n_lanes=2, beta=0.5)
-        r2_left  = compute_progress(10, 10, lane_index=1, n_lanes=2, beta=0.5)
-        assert r2_right < r1 < r2_left
-
     def test_at_desired_speed_no_speed_penalty(self):
-        # When v_ego == v_des, shortfall = 0, r_speed = 1
-        r = compute_progress(10, 10, lane_index=0, n_lanes=1, beta=0.5)
-        r_speed = 1.0
-        r_lane = 0.5
-        expected = r_speed * (0.5 + 0.5 * r_lane)
-        assert r == pytest.approx(expected, rel=1e-6)
+        # When v_ego == v_des, shortfall = 0, r_speed = 1, so r_progress = 1
+        # exactly (the delta_v floor only bites when r_speed < 1).
+        r = compute_progress(10, 10, beta=0.5)
+        assert r == pytest.approx(1.0, rel=1e-6)
 
-    def test_leftmost_lane_scores_higher_than_rightmost(self):
-        r_rightmost = compute_progress(10, 10, lane_index=0, n_lanes=4, beta=0.5)
-        r_leftmost = compute_progress(10, 10, lane_index=3, n_lanes=4, beta=0.5)
-        assert r_leftmost > r_rightmost
+    def test_exceeding_desired_speed_no_penalty(self):
+        # shortfall is clamped at 0 -- going faster than v_des is not
+        # penalised (r_progress is a one-sided shortfall penalty).
+        r_at = compute_progress(10, 10, beta=0.5)
+        r_over = compute_progress(15, 10, beta=0.5)
+        assert r_over == pytest.approx(r_at, rel=1e-6)
+
+    def test_large_shortfall_approaches_floor(self):
+        # v_ego=0 against a large v_des with a tight beta drives r_speed -> 0,
+        # so r_progress -> delta_v (0.1), the numerical floor.
+        r = compute_progress(v_ego=0.0, v_des=20.0, beta=0.05)
+        assert r == pytest.approx(0.1, abs=1e-3)
+
+    def test_larger_beta_is_more_forgiving(self):
+        # Same shortfall, larger beta (softer regime target) -> higher reward.
+        r_tight = compute_progress(v_ego=5.0, v_des=10.0, beta=0.2)
+        r_soft = compute_progress(v_ego=5.0, v_des=10.0, beta=1.0)
+        assert r_soft > r_tight
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,7 +199,7 @@ class TestStyleRewardVector:
         r = compute_style_rewards(
             j_lon=0.0, j_lat=0.0,
             v_ego=10.0, v_des=10.0,
-            lane_index=0, n_lanes=1,
+            beta=default_hp["reward_scaling"]["beta"],
             d_lat=0.0, delta_psi=0.0,
             d_lead=50.0, v_lead=0.0, has_lead=False,
             hp=default_hp,
@@ -217,7 +211,7 @@ class TestStyleRewardVector:
         r = compute_style_rewards(
             j_lon=1.0, j_lat=0.5,
             v_ego=8.0, v_des=10.0,
-            lane_index=1, n_lanes=3,
+            beta=default_hp["reward_scaling"]["beta"],
             d_lat=0.1, delta_psi=0.05,
             d_lead=20.0, v_lead=5.0, has_lead=True,
             hp=default_hp,
@@ -242,7 +236,7 @@ class TestStyleRewardVector:
         r_vec = compute_style_rewards(
             j_lon=0.0, j_lat=0.0,
             v_ego=10.0, v_des=10.0,
-            lane_index=0, n_lanes=1,
+            beta=default_hp["reward_scaling"]["beta"],
             d_lat=0.15, delta_psi=0.0,
             d_lead=50.0, v_lead=0.0, has_lead=False,
             hp=default_hp,

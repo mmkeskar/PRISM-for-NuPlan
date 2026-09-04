@@ -132,28 +132,40 @@ r_comfort = exp(-(j_lon^2 + j_lat^2) / sigma_j_sq)
 
 **Progress** (Eq. progress):
 ```
-r_progress = r_speed * (0.5 + 0.5 * r_lane)
+r_progress = r_speed = delta_v + (1 - delta_v) * exp(-max(0, v_des - v_ego) / (beta * v_des))
 
-r_speed = exp(-max(0, v_des - v_ego) / (beta * v_des))
-r_lane  = lane_index / (N_lanes - 1)   [0.5 if N_lanes == 1]
+delta_v = 0.1   (numerical floor, matches the r_dev/r_spacing pattern below)
+beta is PER REGIME -- hyperparams.json's reward_scaling.beta is a dict
+    {"free_flow": ..., "car_following": ..., "congested": ...}, calibrated
+    separately for each regime from expert rollouts (see
+    compute_hyperparams.py's compute_reward_scaling). The caller
+    (nuplan_env.py's build_reward()) looks up the value for whichever
+    regime is active and passes it to compute_progress()/
+    compute_style_rewards() as an explicit scalar -- those functions stay
+    agnostic to the per-regime dict structure.
 ```
-(No acceleration factor -- an earlier `r_accel = 1 - exp(-|a_ego|/gamma_a)`
-term was removed; it rewarded acceleration magnitude unconditionally,
-punishing steady-state cruising at v_des and fighting r_comfort's jerk
-minimisation. Assertiveness is already captured by r_speed accumulated over
-time via z_t. See CHANGES.md.)
-
-`lane_index` convention: 0 = rightmost (slowest) lane, N_lanes-1 = leftmost
-(fastest) lane -- set by `_lane_position()` in `nuplan_env.py`, which sorts
-candidate lanes ascending by their signed left-perpendicular offset from the
-ego heading. Do not re-derive this from a comment alone; re-derive the
-geometry (an earlier revision of `rewards.py` inverted `r_lane` after
-trusting a stale, backwards comment -- see CHANGES.md).
+(No acceleration factor and no lane-position factor. An earlier
+`r_accel = 1 - exp(-|a_ego|/gamma_a)` term rewarded acceleration magnitude
+unconditionally, punishing steady-state cruising at v_des and fighting
+r_comfort's jerk minimisation -- removed; assertiveness is already captured
+by r_speed accumulated over time via z_t. An earlier `r_lane` term
+prescribed an unconditional leftmost-lane preference -- wrong at exits,
+mandatory turns, and in right-lane-norm jurisdictions; lane position is not
+a robust style axis, and PRISM's contribution is the Pareto front over style
+axes established in the literature (Yusof et al. 2016; Das & Won 2023), not
+the specific reward formulation. Both removed together; r_progress is now
+r_speed directly, with only a numerical floor (not a fix for vanishing
+gradient in the exponential's tail -- see beta above and CHANGES.md).)
 
 **Desired speed regime detection** (check in this order):
 1. Congested:     v_lane_avg < 0.5 * v_limit  →  v_des = v_lane_avg
 2. Car following: lead vehicle in ego lane within horizon  →  v_des = v_lead
-3. Free flow:     otherwise  →  v_des = v_limit
+3. Free flow:     otherwise  →  v_des = max(v_limit, 80th percentile of
+   surrounding-traffic speed), when >= 4 surrounding vehicles are detected
+   (else falls back to v_limit alone -- too few vehicles to trust a
+   percentile estimate). Traffic-aware: progress is about swiftness/
+   efficiency of travel, not "match the median" (a comfort-style target
+   already captured by r_dev/r_heading). See regime_detector.py.
 
 **Lateral discipline** (Eq. lateral):
 ```
@@ -374,8 +386,10 @@ are shared, fixed hyperparameters, not per-policy state.
    vehicle from triggering car-following when the broader lane
    is congested. Always check congestion before car-following.
 
-7. **N=1 lane edge case**: r_lane = 0.5 for single-lane roads.
-   Rationale: lane choice is neutral when there is no choice.
+7. **(Superseded)** ~~N=1 lane edge case: r_lane = 0.5 for single-lane
+   roads.~~ `r_lane` was removed entirely (see the Progress reward section
+   above and CHANGES.md) -- lane position is no longer part of the reward,
+   so this edge case no longer applies.
 
 ---
 
@@ -444,7 +458,8 @@ are shared, fixed hyperparameters, not per-policy state.
 - **Blind spot geometry**: defined as ±45° to ±135° from ego heading,
   within 10m longitudinal and 4m lateral of ego centre.
 - **Three different `beta`s -- do not confuse them**: `reward_scaling.beta`
-  (speed-shortfall scaling for `r_progress`, from `hyperparams.json`),
+  (speed-shortfall scaling for `r_progress`, from `hyperparams.json` -- now a
+  PER-REGIME dict, not a scalar; see the Progress reward section above),
   `ZtNormaliser`'s EMA `beta=0.01` (z_t running-average rate), and the CVaR
   penalty weight `beta` in `configs/*.yaml` (fixed, e.g. `1.0`) are
   unrelated hyperparameters that happen to share a name.

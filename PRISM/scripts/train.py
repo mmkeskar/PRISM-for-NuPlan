@@ -688,8 +688,9 @@ def parse_args():
     parser.add_argument(
         "--log_reward_components", action="store_true",
         help=(
-            "Also log raw reward sub-components (r_speed, r_lane, r_dev, "
-            "r_heading, jerk, ttc) per update -- for "
+            "Also log raw reward sub-components (r_speed, r_dev, r_heading, "
+            "jerk, ttc) plus raw kinematic/regime diagnostics (v_ego, v_des, "
+            "shortfall, regime, n_surrounding_agents, beta) per update -- for "
             "scripts/analyze_reward_spread.py to check whether individual "
             "pieces are plateauing near their ceiling. Off by default (small "
             "extra per-step compute + wider metrics.jsonl records). See "

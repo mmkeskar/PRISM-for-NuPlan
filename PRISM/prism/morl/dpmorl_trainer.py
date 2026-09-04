@@ -383,11 +383,12 @@ class DPMORLTrainer:
             # capability signal, distinct from length alone (a stationary
             # policy can also produce long episodes without driving well).
             local_episode_outcomes: List[str] = []
-            # Raw reward sub-components (r_speed, r_lane, r_dev, r_heading,
-            # jerk, ttc) THIS update, one dict per step -- only populated
-            # when PRISMRewardBuilder's log_components flag is on
-            # (cfg["log_reward_components"], off by default). See
-            # compute_style_rewards_verbose() and CHANGES.md.
+            # Raw reward sub-components (r_speed, r_dev, r_heading, jerk,
+            # ttc) plus raw kinematic/regime diagnostics (v_ego, v_des,
+            # shortfall, regime, n_surrounding_agents, beta) THIS update,
+            # one dict per step -- only populated when PRISMRewardBuilder's
+            # log_components flag is on (cfg["log_reward_components"], off
+            # by default). See compute_style_rewards_verbose() and CHANGES.md.
             local_reward_components: List[dict] = []
             current_ep_id = 0
             current_ep_len = 0
@@ -547,10 +548,32 @@ class DPMORLTrainer:
             if local_reward_components:
                 keys = local_reward_components[0].keys()
                 for key in keys:
+                    if key == "regime":
+                        continue  # categorical -- see regime_stats below, not a mean/std
                     vals = [d[key] for d in local_reward_components if d.get(key) is not None]
                     if vals:
                         component_stats[f"rc_{key}_mean"] = float(np.mean(vals))
                         component_stats[f"rc_{key}_std"] = float(np.std(vals))
+
+            # Per-step regime fraction THIS update -- same fraction-based
+            # aggregation as outcome_stats below, since a regime label is
+            # categorical (free_flow/car_following/congested), not a number
+            # to average. Only populated alongside the other reward_components
+            # diagnostics (log_reward_components on). Lets a persistently-low
+            # rc_v_speed/rc_beta reading be traced to one specific regime
+            # (e.g. free_flow's traffic-aware v_des) rather than spread
+            # evenly across all three -- see CHANGES.md (Part 3.1).
+            regime_stats = {}
+            if local_reward_components:
+                regimes_seen = [
+                    d["regime"] for d in local_reward_components if d.get("regime") is not None
+                ]
+                n_regime = len(regimes_seen)
+                if n_regime:
+                    for regime in ("free_flow", "car_following", "congested"):
+                        regime_stats[f"frac_regime_{regime}"] = (
+                            regimes_seen.count(regime) / n_regime
+                        )
 
             mean_reward_this_update = (
                 float(np.mean(self._buffer.rewards)) if self._buffer.rewards else None
@@ -602,6 +625,7 @@ class DPMORLTrainer:
                 **z_stats,
                 **outcome_stats,
                 **component_stats,
+                **regime_stats,
                 "total_loss": loss_info["total_loss"],
                 "v_loss": loss_info["v_loss"],
                 "entropy": loss_info["entropy"],

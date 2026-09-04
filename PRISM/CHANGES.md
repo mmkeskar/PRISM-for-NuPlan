@@ -2138,3 +2138,189 @@ unused).
       and confirm `rc_jerk_lat_std` is now nonzero -- the direct empirical confirmation this fix
       worked as intended.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-04 — Reward vector Part 1: r_progress redesign, traffic-aware v_des, per-regime beta
+
+### Motivation
+
+User-authored design document ("PRISM: Reward and Cost Function Revisions") proposed a set of
+changes to the style reward vector, framed explicitly around PRISM's actual contribution: "PRISM's
+contribution is an artifact -- a Pareto front of driving styles... The reward functions are an
+operationalization of driving-style axes established in the literature (Yusof et al. 2016; Das &
+Won 2023), not a contribution in themselves. Changes below are motivated by removing unjustified
+prescriptiveness, not by tuning for better numbers." This entry covers Part 1 of that document
+(reward-side changes) plus the accompanying diagnostics from Part 3.1 -- Part 2 (safety cost /
+indicator changes) is a separate, later step in the user's own staged validation sequence
+(reward changes first at `beta=0`, then cost changes, then turn safety on) and is not part of this
+change.
+
+Three changes, discussed and agreed with the user before implementation:
+
+1. **`r_progress = r_speed` directly** (both `r_accel` and `r_lane` removed from the formula).
+   `r_accel` rewarded acceleration magnitude unconditionally -- at the ideal progress behaviour
+   (holding `v_des`, `a_ego~=0`), `r_accel~=0`, so the multiplicative `r_progress~=0`: the best
+   possible behaviour scored worst on its own objective, and it directly fought `r_comfort`'s
+   jerk-minimisation goal. `r_lane` prescribed an unconditional leftmost-lane preference -- wrong
+   at exits, mandatory turns, and in right-lane-norm jurisdictions (already a listed limitation),
+   and lane position is not a robust style axis in the first place. Assertiveness is already
+   captured by `r_speed` accumulated over time via `z_t`, without either term.
+2. **Traffic-aware free-flow `v_des`**: `v_des = max(v_limit, 80th percentile of surrounding-
+   traffic speed)` when >= 4 surrounding vehicles are detected, else falls back to `v_limit` alone.
+   User's own framing: "we want to go with the traffic does not mean we go with the median, we
+   should go with the 80th percentile, because r_progress is also about swiftness and efficiency
+   and getting to the destination faster" -- 80th percentile (not median) deliberately captures
+   assertiveness/efficiency rather than "match typical traffic" (a comfort-style target already
+   captured by `r_dev`/`r_heading`). The >=4-agent guard exists because a percentile over 2-3
+   vehicles is essentially "the fastest one" -- too noisy/outlier-sensitive to use as a moving
+   target.
+3. **Per-regime `beta` calibration**: harder free-flow targets (from #2) needed a corresponding
+   recalibration discussion. Raised directly: "we should curve the rewards so that the rewards are
+   not always very low that the learning just never happens, but at the same time, also reward
+   moving with the fast traffic" -- i.e. don't let the harder target simply flatten `r_speed`'s
+   gradient near zero. Diagnosed as two genuinely separate problems: an additive floor (`delta_v`)
+   fixes the *absolute minimum value* but does NOT restore *gradient*, since `exp(-x)`'s derivative
+   shrinks proportionally to its own value regardless of any floor added on top. The actual fix is
+   calibrating `beta` so the *typical* case lands in the responsive part of the curve -- and since
+   free-flow's target character is now meaningfully different from car-following's (naturally-easy
+   `v_lead`-tracking) and congested's, `beta` is now calibrated SEPARATELY per regime (user:
+   "yes, per regime beta sounds good") rather than pooled into one global value, which would let
+   the easier regimes' small shortfalls mask a persistently-low-gradient free-flow case.
+
+### Change 1: `prism/env/rewards.py` -- r_progress redesign
+
+- Deleted `_progress_components()` (the old `(r_speed, r_lane)` helper).
+- Rewrote `compute_progress(v_ego, v_des, beta)` (dropped `lane_index`/`n_lanes`):
+  `r_progress = r_speed = delta_v + (1 - delta_v) * exp(-max(0, v_des-v_ego) / (beta*v_des))`,
+  `delta_v = 0.1` -- matches the existing `r_dev`/`r_spacing` floor+scaled-exponential pattern
+  already used elsewhere in this vector, so the numerical-floor convention (CLAUDE.md: rewards
+  always in (0,1]) is consistent across all four style rewards.
+  `beta` is now an explicit scalar parameter -- the caller resolves which regime's beta to pass
+  in; `compute_progress()` itself stays agnostic to the per-regime dict structure.
+- `compute_style_rewards()` / `compute_style_rewards_verbose()`: dropped `lane_index`/`n_lanes`,
+  added explicit `beta: float` parameter (previously `compute_style_rewards_verbose()` read
+  `scaling["beta"]` internally -- now takes the resolved scalar like `compute_style_rewards()`
+  does). `compute_style_rewards_verbose()`'s returned `components` dict no longer has a separate
+  `"r_lane"` entry (`"r_speed"` now equals `r_progress` itself, floor included).
+
+### Change 2: `prism/env/regime_detector.py` -- traffic-aware free-flow v_des
+
+- `RegimeResult` gained `n_surrounding_agents: int` (diagnostic -- how thick the percentile
+  estimate's sample was).
+- `RegimeDetector.__init__` gained `flow_percentile=80.0` and `min_agents_for_percentile=4`
+  (reasoned starting points per the design discussion above, not precisely tuned).
+- Replaced `_lane_avg_speed()` (returned only the mean) with `_surrounding_speeds()` (returns the
+  raw list), reused by both `v_lane_avg` (congestion check, unchanged) and the new free-flow
+  percentile logic, so both read from one scan of `tracked_objects` instead of two.
+- Free-flow branch: `v_des = max(v_limit, percentile(surrounding_speeds, 80))` when
+  `n_surrounding >= 4`, else `v_des = v_limit` (unchanged fallback behaviour). `max()` with
+  `v_limit` means this only ever raises `v_des` above the posted limit, never lowers it.
+- Verified offline with a 3-case mock test (fast traffic behind ego -> percentile-driven `v_des`
+  above `v_limit`; too few agents -> fallback to `v_limit`; slow traffic behind ego -> correctly
+  routes to CONGESTED instead, confirming the existing congested-first priority order is intact).
+
+### Change 3: `compute_hyperparams.py` -- per-regime beta calibration
+
+- `_extract_episode()` now captures a per-timestep regime label (`result.regime.name.lower()`,
+  e.g. `"free_flow"`) into a new `regime` array in the returned episode dict, alongside the
+  existing `v_ego`/`v_des`/etc arrays.
+- `compute_reward_scaling()`: `beta` is now a dict `{"free_flow": ..., "car_following": ...,
+  "congested": ...}`, each computed the same way as before (mean shortfall fraction under expert
+  driving) but partitioned by regime. A regime with fewer than `_MIN_SAMPLES_PER_REGIME=500`
+  timesteps across all episodes falls back to the pooled (all-regime) beta with a printed
+  warning -- calibrating from a thin sample would just encode noise as a per-regime "signal".
+- Removed `gamma_a` entirely (bootstrap dict, `compute_reward_scaling()`, its `all_a_ego` input,
+  and the summary print) -- it was the scaling parameter for `r_accel`, which CLAUDE.md already
+  documented as removed in an earlier revision; the hyperparam itself had been left behind,
+  unused by anything in the actual reward path. Confirmed via grep before removing.
+- `hyperparams.json`'s `regime_detection` block now also records `flow_percentile` (80.0) and
+  `min_agents_for_percentile` (4), matching `RegimeDetector`'s new constructor parameters, for
+  reproducibility/tunability alongside the existing `congestion_speed_fraction`/
+  `observation_horizon_m`.
+
+### Change 4: schema/validation/wiring for the new per-regime beta
+
+- `prism/utils/hyperparams.py`: `_validate()` now checks `reward_scaling.beta` is a dict
+  containing all three regime keys, raising a clear `TypeError`/`KeyError` on a stale (pre-this-
+  change) `hyperparams.json` instead of letting a confusing error surface deep inside
+  `rewards.py`. Dropped `gamma_a` from `required_scaling`.
+- `scripts/check_hyperparams.py`: `beta` check rewritten from a single fixed-range check
+  (`0.4-0.6`, "fixed by design") to three per-regime WARN-only checks (`0.01-0.6` each, since
+  `beta` is now genuinely data-driven and its plausible range differs by regime -- e.g.
+  car-following tracks `v_lead` closely so a small shortfall is expected, while free-flow's new
+  traffic-aware target is harder). Dropped the `gamma_a` check.
+- `prism/env/nuplan_env.py`'s `PRISMRewardBuilder.build_reward()`: removed the `_lane_position()`
+  call and the now-fully-dead `_lane_position()` method itself (confirmed via grep it had no other
+  callers), and the now-unused `Lane` import. Added a per-regime beta lookup
+  (`regime_result.regime.name.lower()` -> `hp["reward_scaling"]["beta"][regime_key]`, falling back
+  to `"free_flow"`'s value if a regime name is ever missing rather than raising mid-rollout) passed
+  explicitly into `compute_style_rewards()`/`compute_style_rewards_verbose()`.
+- `make_prism_env()`: `RegimeDetector` construction now also reads `flow_percentile`/
+  `min_agents_for_percentile` from `hp["regime_detection"]` (previously only
+  `congestion_speed_fraction`/`observation_horizon_m` were wired through; the two new fields
+  were silently falling back to `RegimeDetector`'s hardcoded defaults).
+- `scripts/explore_simulator.py`'s placeholder hyperparams dict updated to the new per-regime
+  `beta` dict shape and `gamma_a` dropped, so it stays a valid stand-in for real
+  `hyperparams.json` output.
+
+### Change 5: new diagnostics (Part 3.1) -- raw kinematics + regime fractions
+
+When `log_components`/`--log_reward_components` is on:
+
+- `prism/env/nuplan_env.py`'s `build_reward()` now adds `v_ego`, `v_des`, `shortfall`
+  (`max(0, v_des-v_ego)`), `regime` (the lowercase regime key), `n_surrounding_agents`, and the
+  resolved `beta` into `info["reward_components"]`, alongside the existing reward sub-components.
+  Purpose: distinguish "the v_des target got harder" from "beta wasn't recalibrated for it" from
+  "the policy genuinely isn't keeping up" when `r_speed` looks persistently low, instead of only
+  seeing the aggregate symptom.
+- `prism/morl/dpmorl_trainer.py`: the existing generic `rc_{key}_mean`/`rc_{key}_std` aggregation
+  loop now explicitly skips `"regime"` (categorical, not a number to average) and computes
+  `frac_regime_free_flow`/`frac_regime_car_following`/`frac_regime_congested` instead, using the
+  same fraction-based aggregation pattern already used for `outcome_stats`
+  (`frac_collision`/`frac_off_road`/`frac_completed`).
+- `scripts/analyze_reward_spread.py`: `_COMPONENTS` list dropped `"r_lane"` (no longer produced)
+  and gained `v_ego`/`v_des`/`shortfall`/`beta`/`n_surrounding_agents` as no-fixed-ceiling raw-
+  stats entries. `report_file()` also prints the `frac_regime_*` breakdown when present.
+
+### Change 6: `CLAUDE.md`
+
+Progress reward section rewritten to match the new formula (no more `r_lane`/`lane_index`
+paragraph), free-flow regime-detection bullet updated for the traffic-aware `v_des`, Key Design
+Decision #7 ("N=1 lane edge case") marked superseded (the edge case it described no longer exists
+since `r_lane` is gone), and the "three different betas" convention note updated to flag that
+`reward_scaling.beta` is now a per-regime dict, not a scalar.
+
+### Verification
+
+- `python -m pytest tests/` -- 59/59 passing (`tests/test_rewards.py`'s `TestProgress` and
+  `TestStyleRewardVector` classes rewritten for the new signatures: no more `lane_index`/`n_lanes`
+  tests; new tests for the floor, the one-sided shortfall clamp, and larger-beta-is-more-forgiving).
+- Syntax checks (`ast.parse`) on every modified file.
+- Grepped the full tree for stray `lane_index`/`n_lanes`/`r_lane`/`gamma_a`/`_lane_position`
+  references after the change; the only remaining hits are intentional historical-context comments
+  (`rewards.py`'s "removed" docstring, `CLAUDE.md`'s superseded-decision note) -- no live code or
+  CLI help text left referencing the old signature.
+
+### Outstanding
+
+- [ ] Delete the lab machine's `hyperparams.json` and rerun `make hyperparams-mini` +
+      `make check-hyperparams` -- the per-regime `beta` schema, dropped `gamma_a`, and new
+      `regime_detection.flow_percentile`/`min_agents_for_percentile` fields all require
+      regeneration; an existing file reflects the OLD scalar-beta schema and will now fail
+      `load_hyperparams()`'s stricter validation.
+- [ ] `_MIN_SAMPLES_PER_REGIME=500` and `flow_percentile=80`/`min_agents_for_percentile=4` are all
+      reasoned thresholds, not tuned -- once real data is available, sanity-check that `n >= 500`
+      timesteps per regime is actually being met on the mini dataset (200 rollouts may be thin for
+      `car_following` or `congested` specifically, triggering the pooled-beta fallback more often
+      than intended).
+- [ ] Run a short training smoke test with `--log_reward_components` and confirm `rc_v_speed_mean`
+      (i.e. `r_progress`) is no longer sitting persistently near the `delta_v=0.1` floor in
+      `free_flow` specifically -- the direct empirical check that per-regime `beta` calibration
+      actually restored gradient in the regime it was meant to fix.
+- [ ] Part 2 of the user's design document (safety cost / indicator changes -- 2 indicators, TTC
+      threshold 0.75s, speed-indicator retuning against the new `v_des`, lead-time weight
+      recomputation) and Part 3's remaining diagnostics (3.2 indicator fire rates, 3.3 cost
+      distribution shape) are explicitly Step 2 of the user's own staged validation sequence
+      (cost-side, still `beta=0`) -- not started, not in scope for this entry.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

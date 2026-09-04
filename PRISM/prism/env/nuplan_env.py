@@ -63,7 +63,6 @@ from carl_nuplan.planning.simulation.planner.pdm_planner.utils.pdm_array_represe
 
 # ── nuPlan imports ────────────────────────────────────────────────────────────
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
-from nuplan.common.maps.abstract_map import Lane
 from shapely.geometry import Point
 
 # ── PRISM imports ─────────────────────────────────────────────────────────────
@@ -112,11 +111,14 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         self._terminate_off_road = terminate_on_off_road
         # Instability-analysis diagnostic (not on by default -- see
         # compute_style_rewards_verbose()): when set, build_reward() also
-        # computes and exposes raw reward sub-components (r_speed, r_lane,
-        # r_dev, r_heading, jerk, ttc) via info["reward_components"], for
-        # scripts/analyze_reward_spread.py to check whether individual
-        # pieces are plateauing near their ceiling, independent of anything
-        # PPO training is doing. See CHANGES.md.
+        # computes and exposes raw reward sub-components (r_speed, r_dev,
+        # r_heading, jerk, ttc) plus raw kinematic/regime diagnostics
+        # (v_ego, v_des, shortfall, regime, n_surrounding_agents, beta) via
+        # info["reward_components"], for scripts/analyze_reward_spread.py to
+        # check whether individual pieces are plateauing near their ceiling,
+        # and whether the traffic-aware v_des / per-regime beta calibration
+        # is actually landing typical driving in the responsive part of
+        # r_speed's curve. See CHANGES.md.
         self._log_components = log_components
 
         self._safety = SafetyCostBuilder(
@@ -240,9 +242,6 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         # ── Lateral deviation and heading error ──────────────────────────
         d_lat, delta_psi = self._lateral_quantities(ego_state, current_lane)
 
-        # ── Lane position ────────────────────────────────────────────────
-        lane_index, n_lanes = self._lane_position(ego_state, map_cache, current_lane)
-
         # ── Collision detection ──────────────────────────────────────────
         had_collision, collided_tokens = calculate_non_stationary_collisions(
             ego_state,
@@ -271,14 +270,24 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         had_wrong_direction = self._check_wrong_direction(ego_state, current_lane)
 
         # ── Style rewards ─────────────────────────────────────────────────
+        # beta is now a per-regime dict in hyperparams.json (see
+        # compute_hyperparams.py's compute_reward_scaling and CHANGES.md) --
+        # look up the value for whichever regime is active this step. Falls
+        # back to "free_flow" if detect() ever returns a regime name that
+        # somehow isn't a key (shouldn't happen; Regime enum and the
+        # calibration's _REGIMES tuple are kept in lockstep), rather than
+        # raising mid-rollout.
+        regime_key = regime_result.regime.name.lower()
+        beta_by_regime = self._hp["reward_scaling"]["beta"]
+        beta = beta_by_regime.get(regime_key, beta_by_regime.get("free_flow", 0.5))
+
         if self._log_components:
             r_vec, reward_components = compute_style_rewards_verbose(
                 j_lon=j_lon,
                 j_lat=j_lat,
                 v_ego=v_ego,
                 v_des=regime_result.v_des,
-                lane_index=lane_index,
-                n_lanes=n_lanes,
+                beta=beta,
                 d_lat=d_lat,
                 delta_psi=delta_psi,
                 d_lead=regime_result.d_lead,
@@ -286,6 +295,19 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
                 has_lead=regime_result.has_lead,
                 hp=self._hp,
             )
+            # Raw kinematic/regime diagnostics (not reward sub-components --
+            # see rewards.py's compute_style_rewards_verbose docstring) so
+            # scripts/analyze_reward_spread.py can check whether the
+            # traffic-aware v_des / per-regime beta calibration is actually
+            # landing typical driving in the responsive part of r_speed's
+            # curve, not just whether r_speed itself looks healthy in
+            # isolation. See CHANGES.md (Part 3.1).
+            reward_components["v_ego"] = float(v_ego)
+            reward_components["v_des"] = float(regime_result.v_des)
+            reward_components["shortfall"] = float(max(0.0, regime_result.v_des - v_ego))
+            reward_components["regime"] = regime_key
+            reward_components["n_surrounding_agents"] = int(regime_result.n_surrounding_agents)
+            reward_components["beta"] = float(beta)
             info["reward_components"] = reward_components
         else:
             r_vec = compute_style_rewards(
@@ -293,8 +315,7 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
                 j_lat=j_lat,
                 v_ego=v_ego,
                 v_des=regime_result.v_des,
-                lane_index=lane_index,
-                n_lanes=n_lanes,
+                beta=beta,
                 d_lat=d_lat,
                 delta_psi=delta_psi,
                 d_lead=regime_result.d_lead,
@@ -419,49 +440,6 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
             return d_lat, delta_psi
         except Exception:
             return 0.0, 0.0
-
-    @staticmethod
-    def _lane_position(
-        ego_state, map_cache, current_lane
-    ) -> Tuple[int, int]:
-        """
-        Estimate (lane_index, n_lanes) by counting adjacent lanes.
-        Returns (0, 1) as a safe fallback (r_lane = 0.5).
-        """
-        if current_lane is None or not isinstance(current_lane, Lane):
-            return 0, 1
-        try:
-            # Count adjacent lanes in the same roadblock
-            rb_id = current_lane.get_roadblock_id()
-            all_lanes = [
-                l for l in map_cache.lanes.values()
-                if l.get_roadblock_id() == rb_id
-            ]
-            n_lanes = max(len(all_lanes), 1)
-
-            # Sort by lateral position relative to ego
-            ego_x, ego_y = ego_state.center.x, ego_state.center.y
-            ego_heading = ego_state.center.heading
-            sin_h = math.sin(ego_heading)
-            cos_h = math.cos(ego_heading)
-
-            def lane_lateral_offset(lane):
-                try:
-                    cx, cy = lane.baseline_path.linestring.centroid.x, lane.baseline_path.linestring.centroid.y
-                    dx, dy = cx - ego_x, cy - ego_y
-                    return float(-sin_h * dx + cos_h * dy)
-                except Exception:
-                    return 0.0
-
-            sorted_lanes = sorted(all_lanes, key=lane_lateral_offset)
-            try:
-                lane_index = sorted_lanes.index(current_lane)
-            except ValueError:
-                lane_index = 0
-
-            return lane_index, n_lanes
-        except Exception:
-            return 0, 1
 
     @staticmethod
     def _check_vru_collision(ego_state, detection_cache, collided_tokens: list) -> bool:
@@ -676,17 +654,17 @@ def make_prism_env(
             c_t. Flags for excluded indicators are still set for logging.
         cost_scale: uniform multiplier applied to c_t before it feeds e_t.
         log_components: if True, PRISMRewardBuilder also exposes raw reward
-            sub-components (r_speed, r_lane, r_dev, r_heading, jerk, ttc)
-            via info["reward_components"] -- see
+            sub-components (r_speed, r_dev, r_heading, jerk, ttc) plus raw
+            kinematic/regime diagnostics (v_ego, v_des, shortfall, regime,
+            n_surrounding_agents, beta) via info["reward_components"] -- see
             compute_style_rewards_verbose() and CHANGES.md.
     """
+    _regime_hp = hp.get("regime_detection", {})
     regime_detector = RegimeDetector(
-        congestion_speed_fraction=hp.get("regime_detection", {}).get(
-            "congestion_speed_fraction", 0.5
-        ),
-        observation_horizon_m=hp.get("regime_detection", {}).get(
-            "observation_horizon_m", 50.0
-        ),
+        congestion_speed_fraction=_regime_hp.get("congestion_speed_fraction", 0.5),
+        observation_horizon_m=_regime_hp.get("observation_horizon_m", 50.0),
+        flow_percentile=_regime_hp.get("flow_percentile", 80.0),
+        min_agents_for_percentile=_regime_hp.get("min_agents_for_percentile", 4),
     )
     reward_builder = PRISMRewardBuilder(
         environment_area=environment_area,

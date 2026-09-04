@@ -173,8 +173,9 @@ def _plot_summary(zt, rvec, cost, path: Path, ep: int) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PLACEHOLDER_HP = {
-    "reward_scaling": {"sigma_j_sq": 1.0, "beta": 0.5, "gamma_a": 1.0, "phi": 0.3, "tau": 2.0,
-                       "sigma_d": 0.2},
+    "reward_scaling": {"sigma_j_sq": 1.0,
+                       "beta": {"free_flow": 0.5, "car_following": 0.3, "congested": 0.3},
+                       "phi": 0.3, "tau": 2.0, "sigma_d": 0.2},
     "lead_times": {},
     "indicator_weights": {"ttc": 2.0, "thw": 1.5, "speed": 1.0, "blind_spot": 1.5, "red_light": 2.0},
     "indicator_caps": {"ttc": 80.0, "thw": 73.0, "speed": 93.0, "blind_spot": 90.0, "red_light": 80.0},

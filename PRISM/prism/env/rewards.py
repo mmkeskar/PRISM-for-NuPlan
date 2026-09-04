@@ -3,7 +3,7 @@ PRISM style reward vector (4-dimensional, all in (0, 1]).
 
 Components:
     r_comfort  : jerk-based comfort
-    r_progress : speed + lane position
+    r_progress : speed only (r_speed, floored) -- see compute_progress()
     r_lateral  : lateral discipline (deviation + heading)
     r_spacing  : TTC-based safe following distance
 
@@ -35,59 +35,54 @@ def compute_comfort(j_lon: float, j_lat: float, sigma_j_sq: float) -> float:
     return float(math.exp(-jerk_sq / max(sigma_j_sq, 1e-8)))
 
 
-def _progress_components(
-    v_ego: float,
-    v_des: float,
-    lane_index: int,
-    n_lanes: int,
-    beta: float,
-) -> tuple:
-    """Shared by compute_progress() and compute_style_rewards_verbose() so
-    there's exactly one implementation of the formula -- returns
-    (r_speed, r_lane) rather than the combined scalar."""
-    # Speed sub-reward: penalise shortfall from desired speed
-    v_des_safe = max(v_des, 0.5)  # avoid division by zero
-    shortfall = max(0.0, v_des_safe - v_ego)
-    r_speed = math.exp(-shortfall / (max(beta, 1e-6) * v_des_safe))
-
-    # Lane position sub-reward. lane_index=0 is the RIGHTMOST (slowest)
-    # lane, lane_index=n_lanes-1 is the LEFTMOST (fastest) lane -- this is
-    # the sort order _lane_position() (nuplan_env.py) actually produces
-    # (ascending by left-perpendicular offset from ego heading), and matches
-    # the paper (docs/prism_paper_v2.tex, eq. progress). An earlier revision
-    # of this function inverted the formula based on a comment here that
-    # claimed the opposite convention; that comment was wrong and has been
-    # removed. See CHANGES.md.
-    if n_lanes <= 1:
-        r_lane = 0.5  # neutral when there is no lane choice
-    else:
-        r_lane = float(lane_index) / float(n_lanes - 1)
-
-    return r_speed, r_lane
-
-
 def compute_progress(
     v_ego: float,
     v_des: float,
-    lane_index: int,
-    n_lanes: int,
     beta: float,
 ) -> float:
     """
     Eq. (progress) in paper.
-    r_progress = r_speed * (0.5 + 0.5 * r_lane)
+    r_progress = r_speed = delta_v + (1 - delta_v) * exp(-max(0, v_des-v_ego) / (beta*v_des))
+    delta_v = 0.1 (floor, matches the r_dev/r_spacing pattern used elsewhere
+    in this vector -- see below).
 
-    No longer includes an acceleration factor (see CHANGES.md): |a_ego|
-    rewarded acceleration magnitude unconditionally, which structurally
-    punished steady-state cruising at v_des (already fully rewarded by
-    r_speed) and fought r_comfort's jerk-minimisation goal. Assertiveness
-    (closing a speed gap quickly) is already captured by r_speed accumulated
-    over time via z_t/R_t, without a separate term.
+    Simplified from r_speed * r_accel * (0.5 + 0.5*r_lane); both r_accel and
+    r_lane removed (see CHANGES.md):
+      - r_accel rewarded acceleration MAGNITUDE unconditionally. At the
+        ideal progress behaviour (holding v_des, a_ego~=0), r_accel~=0, so
+        the multiplicative r_progress~=0 -- the best possible behaviour
+        scored worst on its own objective. It also directly fought
+        r_comfort's jerk-minimisation goal. Assertiveness (closing a speed
+        gap quickly) is already captured by r_speed accumulated over time
+        via z_t/R_t, without a separate term.
+      - r_lane prescribed an unconditional leftmost-lane preference --
+        wrong at exits, mandatory turns, and in right-lane-norm
+        jurisdictions (already a listed limitation). Lane position is not
+        a robust style axis. PRISM's contribution is the Pareto front over
+        style axes established in the literature (Yusof et al. 2016; Das &
+        Won 2023), not the specific reward formulation -- forcing a lane
+        preference was exactly the kind of unjustified prescriptiveness
+        that formulation shouldn't carry.
+
+    beta is regime-dependent (free_flow / car_following / congested each
+    calibrated separately from real data, since a policy's typical
+    shortfall differs a lot by regime) -- the CALLER selects which beta to
+    pass in based on the active regime; this function stays a pure
+    function of a single scalar beta, same as before. See
+    compute_hyperparams.py's per-regime calibration and CHANGES.md.
+
+    delta_v is a numerical floor (CLAUDE.md: rewards always in (0,1]), NOT
+    a fix for vanishing gradient in the exponential's tail -- the
+    derivative still shrinks the same way with or without an additive
+    floor. The actual fix for a persistently-low-signal regime is
+    calibrating beta (per-regime, above) against real data so the typical
+    case lands in the responsive part of the curve, not deep in the tail.
     """
-    r_speed, r_lane = _progress_components(
-        v_ego=v_ego, v_des=v_des, lane_index=lane_index, n_lanes=n_lanes, beta=beta
-    )
-    return float(r_speed * (0.5 + 0.5 * r_lane))
+    delta_v = 0.1
+    v_des_safe = max(v_des, 0.5)  # avoid division by zero
+    shortfall = max(0.0, v_des_safe - v_ego)
+    r_speed = math.exp(-shortfall / (max(beta, 1e-6) * v_des_safe))
+    return float(delta_v + (1.0 - delta_v) * r_speed)
 
 
 def _lateral_components(
@@ -165,8 +160,7 @@ def compute_style_rewards(
     j_lat: float,
     v_ego: float,
     v_des: float,
-    lane_index: int,
-    n_lanes: int,
+    beta: float,
     d_lat: float,
     delta_psi: float,
     d_lead: float,
@@ -176,6 +170,13 @@ def compute_style_rewards(
 ) -> np.ndarray:
     """
     Compute the full 4D style reward vector from the current simulation state.
+
+    beta: the regime-selected shortfall scale (see compute_progress()) --
+    hyperparams.json's reward_scaling.beta is now a per-regime dict
+    (free_flow/car_following/congested, each calibrated separately from
+    real data -- see compute_hyperparams.py and CHANGES.md), so the caller
+    looks up the value for whichever regime is currently active and passes
+    it in explicitly. Keeps this function agnostic to the dict structure.
 
     Returns np.ndarray of shape (4,) with values in (0, 1]:
         [r_comfort, r_progress, r_lateral, r_spacing]
@@ -190,9 +191,7 @@ def compute_style_rewards(
     r_progress = compute_progress(
         v_ego=v_ego,
         v_des=v_des,
-        lane_index=lane_index,
-        n_lanes=n_lanes,
-        beta=scaling["beta"],
+        beta=beta,
     )
     r_lateral = compute_lateral_discipline(
         d_lat=d_lat,
@@ -219,8 +218,7 @@ def compute_style_rewards_verbose(
     j_lat: float,
     v_ego: float,
     v_des: float,
-    lane_index: int,
-    n_lanes: int,
+    beta: float,
     d_lat: float,
     delta_psi: float,
     d_lead: float,
@@ -235,11 +233,12 @@ def compute_style_rewards_verbose(
     saturating near its ceiling with little room left to differentiate
     between actions, independent of anything happening in PPO training.
     Opt-in only (PRISMRewardBuilder's log_components flag) -- not used on
-    the default hot training path, since it does a bit of extra work
-    (recomputes r_progress/r_lateral by hand rather than reusing
-    compute_progress/compute_lateral_discipline's single combined return)
-    for the sole purpose of exposing the intermediates. See
-    scripts/analyze_reward_spread.py and CHANGES.md.
+    the default hot training path. See scripts/analyze_reward_spread.py
+    and CHANGES.md.
+
+    r_progress no longer has a separate sub-component to report -- it IS
+    r_speed now (see compute_progress()) -- so "r_speed" below is both the
+    progress sub-component and r_vec[1] itself, not a distinct piece.
 
     Returns (r_vec, components) where r_vec is identical to
     compute_style_rewards()'s return, and components is a dict of raw
@@ -249,11 +248,7 @@ def compute_style_rewards_verbose(
     scaling = hp["reward_scaling"]
 
     r_comfort = compute_comfort(j_lon=j_lon, j_lat=j_lat, sigma_j_sq=scaling["sigma_j_sq"])
-
-    r_speed, r_lane = _progress_components(
-        v_ego=v_ego, v_des=v_des, lane_index=lane_index, n_lanes=n_lanes, beta=scaling["beta"]
-    )
-    r_progress = float(r_speed * (0.5 + 0.5 * r_lane))
+    r_progress = compute_progress(v_ego=v_ego, v_des=v_des, beta=beta)
 
     r_dev, r_heading = _lateral_components(
         d_lat=d_lat, delta_psi=delta_psi, sigma_d=scaling["sigma_d"], phi=scaling["phi"]
@@ -267,8 +262,7 @@ def compute_style_rewards_verbose(
     components = {
         "jerk_lon": float(j_lon),
         "jerk_lat": float(j_lat),
-        "r_speed": float(r_speed),
-        "r_lane": float(r_lane),
+        "r_speed": r_progress,
         "r_dev": float(r_dev),
         "r_heading": float(r_heading),
         "ttc": float(ttc) if math.isfinite(ttc) else None,

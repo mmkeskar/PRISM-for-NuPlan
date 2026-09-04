@@ -36,12 +36,23 @@ from analyze_metrics import load_runs
 # concept and we just report raw statistics instead.
 _COMPONENTS = [
     ("r_speed", 1.0, 0.0),
-    ("r_lane", 1.0, 0.0),
     ("r_dev", 1.0, 0.3),
     ("r_heading", 1.0, 0.0),
     ("jerk_lon", None, None),
     ("jerk_lat", None, None),
     ("ttc", None, None),
+    # Raw kinematic/regime diagnostics (not normalised rewards -- no fixed
+    # ceiling/floor, reported as raw stats only). Added alongside the
+    # traffic-aware v_des / per-regime beta calibration so a persistently
+    # low r_speed can be traced to "v_des target got harder" vs "beta wasn't
+    # recalibrated for it" vs "policy is genuinely not keeping up". See
+    # CHANGES.md (Part 3.1). Per-regime frac_regime_* breakdown is reported
+    # separately by dpmorl_trainer.py (regime is categorical, not a mean).
+    ("v_ego", None, None),
+    ("v_des", None, None),
+    ("shortfall", None, None),
+    ("beta", None, None),
+    ("n_surrounding_agents", None, None),
 ]
 
 
@@ -104,6 +115,17 @@ def report_file(path: Path) -> None:
                       f"per-step spread, whatever the typical value is.")
         else:
             print(f"  (no fixed ceiling for this component -- reporting raw stats only)")
+
+    # Regime fraction breakdown (categorical -- see dpmorl_trainer.py's
+    # regime_stats, computed separately from the rc_*_mean/std loop above
+    # since a regime label isn't a number to average).
+    regime_keys = [f"frac_regime_{r}" for r in ("free_flow", "car_following", "congested")]
+    if any(u.get(k) is not None for u in updates for k in regime_keys):
+        print("\n-- regime fractions (mean over run) --")
+        for key in regime_keys:
+            vals = [u[key] for u in updates if u.get(key) is not None]
+            if vals:
+                print(f"  {key}: {statistics.mean(vals):.4f}")
 
     if not found_any:
         print("  No rc_*_mean/rc_*_std fields found -- this run wasn't started with "
