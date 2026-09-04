@@ -137,15 +137,15 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
 
     # ── 2. Kinematic arrays ───────────────────────────────────────────────────
     head_arr = np.array([s.center.heading for s in ego_states])
-    cos_h    = np.cos(head_arr)
-    sin_h    = np.sin(head_arr)
 
     # Extract velocity, acceleration, and angular velocity from the EgoState's
     # built-in IMU-derived fields.  Finite-differencing position three times to
     # get jerk would amplify GPS noise by (1/DT)^3 = 1000×, producing
     # sigma_j_sq ~4000× too large.  Using the stored signals avoids this entirely.
     # _safe_kinematics() falls back to single-level finite differencing if the
-    # built-in fields are unavailable.
+    # built-in fields are unavailable. No heading rotation -- see
+    # _safe_kinematics()'s docstring for why (rear_axle_velocity_2d/
+    # acceleration_2d are already local/body frame; rotating was a bug).
     v_lon_raw = np.zeros(n_iter)
     v_lat_raw = np.zeros(n_iter)
     a_lon     = np.zeros(n_iter)
@@ -153,7 +153,7 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
     ang_vel   = np.zeros(n_iter)
 
     for i, s in enumerate(ego_states):
-        vl, vt, al, at, av = _safe_kinematics(s, cos_h[i], sin_h[i])
+        vl, vt, al, at, av = _safe_kinematics(s)
         v_lon_raw[i] = vl
         v_lat_raw[i] = vt
         a_lon[i]     = al
@@ -294,25 +294,30 @@ def _extract_episode(scenario, regime_detector, bootstrap_hp: Dict,
 
 
 def _safe_kinematics(
-    ego_state, cos_h: float, sin_h: float
+    ego_state,
 ) -> Tuple[float, float, float, float, float]:
     """
     Extract (v_lon, v_lat, a_lon, a_lat, angular_velocity) from EgoState using
     the built-in IMU-derived DynamicCarState fields.
 
-    Returns zero-filled tuple on failure so callers can fall back to finite
-    differences at the episode level if needed.
+    rear_axle_velocity_2d / rear_axle_acceleration_2d are already in the
+    vehicle's LOCAL (body) frame -- x=longitudinal, y=lateral -- confirmed
+    empirically (scripts/check_accel_frame.py / scripts/run_accel_frame_check.py):
+    raw v2d.x matches the unambiguous scalar `speed` almost exactly
+    (error ~1e-3) across real scenarios, while rotating by heading first (as
+    this function previously did) diverges from `speed` by up to several
+    m/s on curved paths -- a heading rotation was WRONG here, not a
+    correction, and had been silently corrupting v_lon/v_lat/a_lon/a_lat
+    (and everything calibrated from them: sigma_j_sq, beta, and the TTC/
+    regime-detection calibration that reads v_ego) for any scenario
+    involving real heading change. See CHANGES.md.
     """
     try:
         dcs = ego_state.dynamic_car_state
         v2d = dcs.rear_axle_velocity_2d
         a2d = dcs.rear_axle_acceleration_2d
-        v_lon =  v2d.x * cos_h + v2d.y * sin_h
-        v_lat = -v2d.x * sin_h + v2d.y * cos_h
-        a_lon =  a2d.x * cos_h + a2d.y * sin_h
-        a_lat = -a2d.x * sin_h + a2d.y * cos_h
         ang_vel = float(dcs.angular_velocity)
-        return v_lon, v_lat, a_lon, a_lat, ang_vel
+        return float(v2d.x), float(v2d.y), float(a2d.x), float(a2d.y), ang_vel
     except Exception:
         pass
     # Fallback: speed scalar only, zero acceleration

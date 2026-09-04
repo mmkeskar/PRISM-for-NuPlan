@@ -2051,3 +2051,90 @@ changes the final output path.
       update baseline -- that's the specific thing this config exists to re-check, now with much
       better tooling.
 - [ ] Everything else from prior entries' Outstanding sections still applies.
+
+---
+
+## 2026-09-03 (cont.) — Acceleration frame convention resolved; jerk_lat and savgol-filtered jerk fixed
+
+### Frame convention: resolved, and the bug was in the OTHER file
+
+Ran `scripts/run_accel_frame_check.py` against 3 real nuPlan scenarios. Conclusive result: raw
+`rear_axle_velocity_2d.x` matches the unambiguous scalar `speed` almost exactly (mean error
+0.0002-0.0011 across all three scenarios -- floating-point-level noise). The heading-rotated
+version's error, by contrast, *grows with how much the scenario curves*: 0.0019 in a
+nearly-straight scenario, up to 3.98 (bigger than the true speed) in a scenario with real
+heading change. This settles it: `rear_axle_velocity_2d`/`rear_axle_acceleration_2d` are already
+in the vehicle's LOCAL (body) frame -- x=longitudinal, y=lateral -- no rotation needed.
+
+This flips which file had the bug. `prism/env/nuplan_env.py`'s direct, unrotated `.x`/`.y` read
+was correct all along -- `j_lon` has genuinely been measuring true longitudinal jerk all
+session, not a frame-mixed quantity. `compute_hyperparams.py`'s `_safe_kinematics()`, which
+rotated by heading before treating `.x`/`.y` as longitudinal/lateral, was wrong -- and had been
+silently corrupting `v_lon`/`v_lat`/`a_lon`/`a_lat` for any scenario involving real heading
+change, for as long as that function has existed. This affects `sigma_j_sq`'s calibration, the
+TTC/regime-detection calibration (both read `v_ego = abs(v_lon_raw)`), and -- caught before it
+ever ran -- the `beta` calibration added two entries back, which reads the same `v_ego`.
+
+### Change 1: `compute_hyperparams.py` -- removed the erroneous rotation
+
+`_safe_kinematics()` no longer takes `cos_h`/`sin_h` or rotates by them; returns
+`v2d.x`/`v2d.y`/`a2d.x`/`a2d.y` directly. Removed the now-unused `cos_h`/`sin_h` array
+computation in `_extract_episode()` (they were only ever used for this rotation). `head_arr`
+itself is unaffected (still used for `head_s`/`delta_psi`, unrelated to this bug).
+
+### Change 2: `prism/env/nuplan_env.py` -- `jerk_lat`=0 fix + proper savgol-filtered jerk
+
+Two things fixed together, since both are about the same underlying "jerk computation doesn't
+match CLAUDE.md's documented convention" gap:
+
+- **`a_lat` fallback**: `angular_velocity` reads exactly 0.0 for every ego state in the nuPlan
+  mini dataset (documented, pre-existing CLAUDE.md caveat). `rear_axle_acceleration_2d.y` has
+  been measured as exactly 0.0 (mean AND std) across full real training runs this session --
+  consistent with nuPlan deriving rear-axle lateral acceleration from yaw rate under the
+  standard no-side-slip assumption, inheriting the same gap. Now detected the same way CLAUDE.md
+  already documents for `delta_psi` (max `|angular_velocity|` over a trailing window < 1e-5) and
+  fixed the same way: `a_lat = v_ego * yaw_rate`, with `yaw_rate` from a causally-smoothed finite
+  difference of heading (new `_causal_yaw_rate()`) instead of the broken field. `np.unwrap()`
+  applied first -- heading wraps at +-pi, and a naive difference across a wrap point would
+  produce a spurious ~2*pi/dt jump.
+- **Savitzky-Golay smoothed jerk**: previously a raw, one-step backward difference of
+  acceleration -- CLAUDE.md documents `savgol_filter(window=7, polyorder=2)` then one
+  `np.gradient` call, matching what `compute_hyperparams.py` already does for calibration, but
+  this was never implemented in the live training path. `savgol_filter` is normally centered
+  (needs future samples, unavailable online without delaying every reward by half a window);
+  new `_causal_jerk()` applies it to a trailing window ending at the CURRENT step and reads the
+  gradient at that window's own right edge -- causal by construction, not a centered filter
+  evaluated off-center. Ramps up gracefully at the start of each episode (no smoothing below a
+  3-sample window, full window=7 once enough history accumulates) rather than needing a separate
+  "not enough history yet" special case.
+
+`PRISMRewardBuilder` now tracks trailing history (`_heading_history`, `_angvel_history`,
+`_accel_lon_history`, `_accel_lat_history`, all capped at `_SAVGOL_WINDOW=7`, reset per episode)
+instead of the previous single-previous-value `_prev_accel_lon`/`_prev_accel_lat` (removed, now
+unused).
+
+### Verification
+
+- `python -m pytest tests/` -- 58/58 passing.
+- Syntax checks on both modified files.
+- `PRISMRewardBuilder(log_components=True)` constructs and `reset()`s without error.
+- Offline, direct tests of `_causal_jerk()`/`_causal_yaw_rate()` (both callable standalone --
+  `_causal_jerk` is a staticmethod):
+  - Ramp-up from 1 to 7 samples produces sane, non-crashing values at every step (0.0 at n=1,
+    matching the previous "no history yet" behavior).
+  - Constant acceleration -> jerk ~0 (measured 8.9e-15, numerically exact).
+  - A known linear acceleration ramp (slope 0.5/step) -> jerk = 5.0 exactly, matching the
+    analytically expected `slope/DT = 0.5/0.1`.
+  - A synthetic heading trace crossing the +pi/-pi wraparound -> yaw_rate = 0.50 rad/s (small,
+    physically sane), not the ~60+ rad/s a naive (non-unwrapped) difference would produce.
+
+### Outstanding
+
+- [ ] Re-run `make hyperparams-mini` on the lab machine to get corrected calibration values now
+      that `_safe_kinematics()`'s rotation bug is fixed -- `sigma_j_sq` and `beta` were both
+      affected; existing `hyperparams.json` (if already computed) reflects the OLD, rotated
+      values and should be regenerated before further training.
+- [ ] Run DPMORL-only (or the indicator-costs experiment) again with `--log_reward_components`
+      and confirm `rc_jerk_lat_std` is now nonzero -- the direct empirical confirmation this fix
+      worked as intended.
+- [ ] Everything else from prior entries' Outstanding sections still applies.

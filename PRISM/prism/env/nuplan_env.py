@@ -35,6 +35,7 @@ import traceback
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
+from scipy.signal import savgol_filter
 
 # ── CaRL imports ──────────────────────────────────────────────────────────────
 from carl_nuplan.planning.gym.environment.environment_wrapper import EnvironmentWrapper
@@ -125,16 +126,26 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         )
 
         # Episode state
-        self._prev_accel_lon: Optional[float] = None
-        self._prev_accel_lat: Optional[float] = None
+        # Jerk computation: trailing (causal) windows for the Savitzky-Golay
+        # smoothing CLAUDE.md documents (window<=7, poly=2) -- previously a
+        # raw, unsmoothed one-step backward difference of acceleration, and
+        # a_lat was read directly with no fallback for when it reads
+        # degenerate. See _causal_jerk()/_causal_yaw_rate() and CHANGES.md.
+        self._SAVGOL_WINDOW = 7
+        self._heading_history: list = []
+        self._angvel_history: list = []
+        self._accel_lon_history: list = []
+        self._accel_lat_history: list = []
         self._prev_collided_tokens: list = []
         self._expert_rl_infractions: list = []
         self._episode_step: int = 0
 
     def reset(self) -> None:
         self._safety.reset()
-        self._prev_accel_lon = None
-        self._prev_accel_lat = None
+        self._heading_history = []
+        self._angvel_history = []
+        self._accel_lon_history = []
+        self._accel_lat_history = []
         self._prev_collided_tokens = []
         self._expert_rl_infractions = []
         self._episode_step = 0
@@ -169,20 +180,62 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
         # ── Kinematic quantities ─────────────────────────────────────────
         state = ego_state.dynamic_car_state
         v_ego = state.speed
+        heading = float(ego_state.center.heading)
         try:
+            # rear_axle_acceleration_2d is already in the vehicle's local
+            # (body) frame -- x=longitudinal, y=lateral -- confirmed
+            # empirically (scripts/check_accel_frame.py against real
+            # scenarios: raw .x matches the unambiguous scalar `speed` to
+            # ~1e-3, while rotating by heading first diverges by several
+            # m/s on curved paths). No rotation here. See CHANGES.md.
             a_lon = float(state.rear_axle_acceleration_2d.x)
-            a_lat = float(state.rear_axle_acceleration_2d.y)
+            a_lat_raw = float(state.rear_axle_acceleration_2d.y)
+            ang_vel = float(state.angular_velocity)
         except Exception:
-            a_lon, a_lat = 0.0, 0.0
+            a_lon, a_lat_raw, ang_vel = 0.0, 0.0, 0.0
 
-        # Jerk = Δa / Δt
-        if self._prev_accel_lon is not None:
-            j_lon = (a_lon - self._prev_accel_lon) / _DT
-            j_lat = (a_lat - self._prev_accel_lat) / _DT
+        self._heading_history.append(heading)
+        self._angvel_history.append(ang_vel)
+        if len(self._heading_history) > self._SAVGOL_WINDOW:
+            self._heading_history.pop(0)
+            self._angvel_history.pop(0)
+
+        # angular_velocity reads exactly 0.0 for every ego state in the
+        # nuPlan mini dataset (see CLAUDE.md's angular_velocity caveat).
+        # rear_axle_acceleration_2d.y ("a_lat_raw") has been measured as
+        # exactly 0.0 (mean AND std) across full real training runs this
+        # session too -- consistent with nuPlan deriving rear-axle lateral
+        # acceleration from yaw rate under the standard no-side-slip
+        # assumption, so it inherits the same gap. Detected the same way
+        # CLAUDE.md already documents for delta_psi (max |angular_velocity|
+        # over a window < 1e-5), fixed the same way: a_lat = v_ego * yaw_rate
+        # (the standard rear-axle centripetal approximation), with yaw_rate
+        # from a causally-smoothed finite difference of heading instead of
+        # the broken angular_velocity field. See CHANGES.md.
+        if (
+            max((abs(v) for v in self._angvel_history), default=0.0) < 1e-5
+            and len(self._heading_history) >= 2
+        ):
+            a_lat = v_ego * self._causal_yaw_rate()
         else:
-            j_lon, j_lat = 0.0, 0.0
-        self._prev_accel_lon = a_lon
-        self._prev_accel_lat = a_lat
+            a_lat = a_lat_raw
+
+        self._accel_lon_history.append(a_lon)
+        self._accel_lat_history.append(a_lat)
+        if len(self._accel_lon_history) > self._SAVGOL_WINDOW:
+            self._accel_lon_history.pop(0)
+            self._accel_lat_history.pop(0)
+
+        # Jerk: Savitzky-Golay smoothed (window<=7, poly=2) then one finite
+        # difference, per CLAUDE.md's documented convention -- previously a
+        # raw, unsmoothed one-step backward difference. savgol_filter is
+        # normally centered (needs future samples, unavailable online);
+        # _causal_jerk() applies it to the trailing window ending at the
+        # CURRENT step and reads the gradient at that window's own right
+        # edge, which np.gradient computes with a one-sided formula there --
+        # causal by construction, not a centered filter evaluated off-center.
+        j_lon = self._causal_jerk(self._accel_lon_history)
+        j_lat = self._causal_jerk(self._accel_lat_history)
 
         # ── Lateral deviation and heading error ──────────────────────────
         d_lat, delta_psi = self._lateral_quantities(ego_state, current_lane)
@@ -292,6 +345,50 @@ class PRISMRewardBuilder(AbstractRewardBuilder):
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _causal_yaw_rate(self) -> float:
+        """
+        Savgol-smoothed, causally (trailing-window) finite-differenced yaw
+        rate from self._heading_history -- the angular_velocity fallback
+        used by build_reward()'s a_lat computation. np.unwrap() first,
+        since heading wraps at +-pi and a naive difference across a wrap
+        point would produce a spurious jump of ~2*pi.
+        """
+        heads = np.unwrap(np.asarray(self._heading_history, dtype=np.float64))
+        n = len(heads)
+        if n < 2:
+            return 0.0
+        window_length = n if n % 2 == 1 else n - 1
+        if window_length >= 3:
+            try:
+                heads = savgol_filter(heads, window_length=window_length, polyorder=2)
+            except Exception:
+                pass
+        return float(np.gradient(heads, _DT)[-1])
+
+    @staticmethod
+    def _causal_jerk(accel_history: list) -> float:
+        """
+        Savitzky-Golay smoothed (window<=7, poly=2) jerk from a trailing
+        acceleration window, reading the finite difference at the window's
+        own right edge -- CLAUDE.md's documented jerk-computation
+        convention, adapted for online use where savgol_filter's normal
+        centered window (needing future samples) isn't available. Ramps up
+        gracefully as the window fills at the start of each episode: no
+        smoothing below window_length=3 (falls back to a plain two-point
+        difference), full window=7 once enough history has accumulated.
+        """
+        accels = np.asarray(accel_history, dtype=np.float64)
+        n = len(accels)
+        if n < 2:
+            return 0.0
+        window_length = n if n % 2 == 1 else n - 1
+        if window_length >= 3:
+            try:
+                accels = savgol_filter(accels, window_length=window_length, polyorder=2)
+            except Exception:
+                pass
+        return float(np.gradient(accels, _DT)[-1])
 
     @staticmethod
     def _lateral_quantities(
